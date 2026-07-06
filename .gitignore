@@ -1,0 +1,6 @@
+node_modules/
+.env
+*.log
+.riffn-bridge-session.json
+.riffn-bridge-job.json
+.riffn-bridge-history.jsonl
