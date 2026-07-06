@@ -3,8 +3,6 @@
   "version": "0.2.0",
   "description": "Voice-drive your OWN agents/models from Riffn: an OpenAI-compatible shim over a local CLI agent (Claude Code / Codex) reached over Tailscale. Read/plan-only; zero runtime dependencies.",
   "type": "module",
-  "private": true,
-  "//private": "Kept private to HARD-BLOCK accidental `npm publish` until the supply-chain gate is verified (bridge_plan.md §10.5/§10.11). Removing this is part of the publish gate, not a routine change.",
   "bin": {
     "riffn-bridge": "index.js"
   },
