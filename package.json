@@ -8,6 +8,14 @@
   "bin": {
     "riffn-bridge": "index.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dench88/riffn-bridge.git"
+  },
+  "homepage": "https://github.com/dench88/riffn-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/dench88/riffn-bridge/issues"
+  },
   "scripts": {
     "start": "node index.js start",
     "init": "node index.js init"
@@ -16,6 +24,7 @@
     "index.js",
     "src/",
     "README.md",
+    "SECURITY.md",
     ".env.example"
   ],
   "engines": {

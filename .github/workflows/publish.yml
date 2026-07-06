@@ -1,0 +1,38 @@
+# npm publish gate (bridge_plan.md §10.5): CI-only publishing with provenance.
+# Triggers ONLY on a version tag (v0.2.0 …). Bootstrap: authenticates with the short-lived
+# NPM_TOKEN repository secret; after the first publish, configure npm Trusted Publishing for
+# this repo+workflow, revoke the token, and delete the secret — the OIDC id-token permission
+# below then carries authentication by itself.
+name: Publish to npm
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write # Sigstore provenance attestation (and tokenless publish once trusted publishing is on)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Tag must match package.json version
+        run: |
+          pkg="v$(node -p "require('./package.json').version")"
+          [ "$pkg" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != package version $pkg"; exit 1; }
+
+      - name: Refuse to publish while the private hard-block is set
+        run: |
+          node -e "if (require('./package.json').private) { console.error('package.json still has \"private\": true — the §10.5 gate ceremony removes it deliberately.'); process.exit(1); }"
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

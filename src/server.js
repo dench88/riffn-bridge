@@ -352,6 +352,8 @@ export function startServer(cfg) {
     const agentLabel = cfg.agent === "custom" ? `custom '${cfg.customAgentBin}'` : `'${cfg.agent}'`;
     console.log(`riffn-bridge v${VERSION} listening on http://${cfg.host}:${cfg.port}  (pid ${process.pid})`);
     console.log(`  mode: ${cfg.mode === "cli" ? `CLI agent ${agentLabel}` : "HTTP LLM proxy"}   caps: ${capsLabel}`);
+    // EULA/disclaimer line (bridge_plan.md §10.7) — printed on every start, not just init.
+    console.log(`  note: this bridge executes an agent on YOUR machine; you control its permissions — run at your own risk.`);
     const capsWarning = customAgentCapsWarning(cfg);
     if (capsWarning) console.warn(capsWarning);
     // Full, unredacted paths here are fine — this is the operator's own terminal, not the wire to

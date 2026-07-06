@@ -11,7 +11,7 @@ helper and talk to the agent on your own machine — **no app changes, no worker
 > token, and — in this version — runs the agent **read/plan-only** (no file writes, no command
 > execution). Enabling write/exec is a separate, security-reviewed project; see the plan.
 
-This is the **Phase 1.5 minimal cut** — see [`../../dev_resources/bridge_plan.md`](../../dev_resources/bridge_plan.md) §7.1.
+This is the **Phase 1.5 minimal cut** of the bridge plan: link + trust, deliberately small.
 
 ---
 
@@ -23,8 +23,19 @@ This is the **Phase 1.5 minimal cut** — see [`../../dev_resources/bridge_plan.
 
 ## Quick start
 
+In the repo (working directory) you want to talk to:
+
 ```bash
-cd tools/riffn-bridge     # (repo folder is tools/riffin-bridge)
+npx @riffn/bridge@0.2.0 init
+```
+
+**Pin the version** (as above) rather than running a floating `npx @riffn/bridge` — you're
+executing code that drives an agent on your machine; pinning means the code you audited is the
+code you run. Update deliberately.
+
+Running from a clone instead (dev / audit-first):
+
+```bash
 node index.js init
 ```
 
@@ -79,6 +90,11 @@ Use `https://<machine>.<tailnet>.ts.net/v1` as the Model URL.
 - **Redact-by-default logs** — token, prompts, code, cwd, subprocess args, and URLs are never logged
   at default verbosity. `RIFFIN_BRIDGE_VERBOSE=1` enables diagnostics (may capture sensitive data).
 - **Zero runtime dependencies** (Node built-ins only).
+- Releases are published **from CI only, with npm provenance** — verify the attestation on the
+  package's npm page. Vulnerability reports: see [SECURITY.md](SECURITY.md) (please don't open
+  public issues for security findings). License: [Apache-2.0](LICENSE).
+- Disclaimer: this helper executes an agent on **your** machine; you control its permissions —
+  run at your own risk.
 
 ## Agent jobs (Claude only)
 
