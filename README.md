@@ -39,6 +39,34 @@ Running from a clone instead (dev / audit-first):
 node index.js init
 ```
 
+## What leaves my machine?
+
+**Nothing goes to Riffn's servers — they are never in the path.** Your phone talks straight to
+this helper over your own tailnet, and the helper drives the agent CLI you already installed:
+
+- Prompts and replies go to **your** model provider (Anthropic / OpenAI) via **your** CLI and
+  **your** API account — exactly the same data flow as typing into Claude Code in a terminal.
+- The helper sends your phone only what you asked for: the reply text, job status (step counts
+  and activity *categories*, never file contents), and the redacted health summary.
+- No telemetry, no analytics, no crash reporting. Logs stay on your machine and redact the
+  token, prompts, code, and paths by default.
+- The one new trust surface is this helper itself — which is why it's ~100 KB of dependency-free
+  source you can read before running, published from CI with npm provenance.
+
+## Keeping it running
+
+v1 is deliberately a **foreground process** — no background service is installed on your
+machine (that's a feature until you decide otherwise). Practical recipes:
+
+- **tmux / screen:** `tmux new -s riffn-bridge`, run `npx @riffn/bridge@0.2.0 start`, detach
+  (`Ctrl-B D`). Survives closing the terminal window; not a reboot.
+- **Keep the machine awake:** macOS `caffeinate -s`, Windows *Settings → Power → never sleep
+  when plugged in* (or `powercfg /change standby-timeout-ac 0`), Linux inhibit as you prefer.
+- If the machine does sleep or the helper stops, nothing breaks: Riffn shows the machine as
+  offline and your phone falls back to hosted chat; restart the helper and "switch to" it again.
+  A job left running when the helper dies is honestly reported as `interrupted`, never lost as
+  forever-"running".
+
 `init` will: detect your agent → generate a bearer token → check Tailscale → print a **pairing QR** →
 run in the **foreground** (Ctrl-C to stop). Then in Riffn: **Link my machine → scan the QR.**
 
