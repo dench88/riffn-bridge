@@ -9,7 +9,12 @@
 // Commands:
 //   riffn-bridge init        Interactive setup: detect agent, generate token, verify Tailscale,
 //                            print the pairing QR, and run in the foreground. (Phase 1.5 cut.)
+//   riffn-bridge init --llm  Custom Agents wizard: Ollama probe / --llm <url> / --openclaw,
+//                            multi-entry pairing QR, Mode B proxy (or --link-only, no proxy).
 //   riffn-bridge start       Start the bridge using existing .env / environment.
+//   riffn-bridge tts         Voice pairing wizard: on the machine running your TTS server,
+//                            asks for its URL, verifies it, prints the pairing QR, and runs
+//                            in the foreground. No prior `init` or hand-edited .env required.
 //   riffn-bridge rotate      Generate a new bearer token (invalidates the old QR/token).
 //   riffn-bridge reset-session  Clear the persistent agent session (start a fresh thread).
 //   riffn-bridge health      Print the effective config (redacted) without starting the server.
@@ -38,6 +43,14 @@ async function main() {
       startServer(readConfig());
       break;
     }
+    case "tts": {
+      // One-command voice pairing (tts_profiles_plan.md Phase 4): go to the TTS machine, run
+      // this, answer two prompts, scan. Mirrors `init`'s shape but asks for the TTS URL itself
+      // (init never does) — no prior `riffn-bridge init` or hand-edited .env required.
+      const { runInitTTS } = await import("./src/init-tts.js");
+      await runInitTTS(rest);
+      break;
+    }
     case "rotate": {
       loadEnvFile(envPath);
       // Deliberately NOT echoed to the terminal (§10.6: the token must never sit in scrollback;
@@ -56,7 +69,7 @@ async function main() {
       const { agentCaps } = await import("./src/agent.js");
       const cfg = readConfig();
       const session = cfg.mode === "cli" && cfg.agent === "claude"
-        ? createSessionStore(cfg.envDir, cfg.cwd)
+        ? createSessionStore(cfg.envDir, cfg.cwd, cfg.editMode)
         : null;
       console.log(JSON.stringify({
         version: VERSION,
@@ -99,7 +112,20 @@ function printHelp() {
 
 Usage:
   riffn-bridge init        Setup wizard: detect agent, token, verify Tailscale, print QR, run.
+                           --agent claude|codex picks the CLI agent explicitly (else detection
+                           prefers claude). For any other CLI use RIFFIN_BRIDGE_AGENT=custom.
+                           --edit-mode disabled|limited|ungated skips the edit-capability
+                           prompt (ungated still requires the typed acknowledgement, so it
+                           needs an interactive terminal).
+  riffn-bridge init --llm  Custom Agents wizard (Riffn → My Custom Agents): probe local Ollama
+                           and pick models, or --llm <url> for any OpenAI-compatible endpoint,
+                           or --openclaw for an OpenClaw gateway. Runs an LLM proxy by default;
+                           add --link-only to print a direct QR without running anything.
   riffn-bridge start       Start using existing .env / environment.
+  riffn-bridge tts [url]   Voice pairing wizard: asks for your TTS server's URL (or takes it
+                           as an argument), verifies it, prints the QR, and runs. Scan in
+                           Riffn → Settings → Voice → Voice on My Machine. Add --yes to accept
+                           defaults non-interactively (needs the url argument).
   riffn-bridge rotate      New bearer token (invalidates the old QR).
   riffn-bridge reset-session  Clear the persistent agent session (fresh thread next turn).
   riffn-bridge health      Print effective config (redacted), don't start.

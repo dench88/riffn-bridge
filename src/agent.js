@@ -15,6 +15,8 @@
 
 import { spawn } from "node:child_process";
 import { errorType, log } from "./log.js";
+import { EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS } from "./edit-policy.js";
+import { resolveSpawnTarget } from "./win-shim.js";
 
 function contentText(content) {
   return typeof content === "string"
@@ -70,20 +72,81 @@ function lastUserMessage(messages) {
   return "";
 }
 
-// Build the agent command. For claude/codex: READ/PLAN-ONLY — no permission-escalation flags are
-// ever added here. For a CUSTOM agent the helper cannot enforce that (the operator's own agent
-// config decides what it may do) — see customAgentCapsWarning/agentCaps.
-function agentCommand(cfg, prompt, sessionId, appendSystemPrompt) {
+// Central effective-permission derivation (edit_mode_plan.md, review finding #3): ONE function
+// maps (edit mode, requested caps) to what an invocation actually runs with, consulted by BOTH
+// the /v1/chat/completions handler and /v1/jobs dispatch — the app routes every ordinary turn
+// through jobs on a jobs-capable machine, so deriving permissions in only one path would leave
+// the other one wrong. Returns:
+//   "read"    — read/plan-only (default; also any request the mode doesn't allow)
+//   "edit"    — the limited tier's armed, confirm-gated edit TASK: containment + fresh session +
+//               per-task snapshot (execute_jobs_plan.md)
+//   "ungated" — the ungated tier (Claude): containment + RESUMABLE mode-stamped session +
+//               per-turn ring snapshot; applies to every turn, requested or not
+// The 403 for a caps:"edit" request against a disabled machine stays in server.js (it's a wire
+// error, not a derivation). Codex never reaches here for writes — its posture is the sandbox flag.
+export function effectiveCaps(cfg, requestedCaps) {
+  if (cfg.mode !== "cli" || cfg.agent !== "claude") return "read";
+  if (cfg.editMode === "ungated") return "ungated";
+  // Gate on the derived allowEditJobs boolean (not editMode === "limited" directly): it's the
+  // same workstation-arming flag the server's 403 check consults, so the two can never disagree.
+  if (requestedCaps === "edit" && cfg.allowEditJobs) return "edit";
+  return "read";
+}
+
+// Build the agent command. For claude (below ungated), and codex below ungated: READ/PLAN-ONLY —
+// no permission-escalation flags are ever added here. For a CUSTOM agent the helper cannot enforce
+// that (the operator's own agent config decides what it may do) — see customAgentCapsWarning/
+// agentCaps. Exported (pure) so tests can pin the sandbox/permission flags without spawning.
+// `edit` ({ settingsPath, mcpConfigPath } | null): when set, a Claude turn runs under the SAME
+// four-layer containment as an edit job (edit-policy.js) with file writes allowed — the ungated
+// chat path. Never set for read/plan turns.
+export function agentCommand(cfg, prompt, sessionId, appendSystemPrompt, edit = null) {
   if (cfg.agent === "claude") {
     // Headless `claude -p` cannot answer interactive permission prompts, so tool actions requiring
     // permission are denied by default — which is exactly the read/plan-only posture we want in v1.
     const args = ["-p", prompt, "--output-format", "json"];
+    if (edit) {
+      // Same defence-in-depth set as buildJobArgs (jobs.js) — hook is the guarantee, the rest
+      // fail-closed backup. Passed on EVERY ungated turn: the flags bind at session creation and
+      // are harmless on resume, and the mode-stamped session store guarantees any resumed session
+      // was itself created under ungated (i.e. with this exact set).
+      args.push("--settings", edit.settingsPath);
+      args.push("--permission-mode", "dontAsk");
+      args.push("--strict-mcp-config", "--mcp-config", edit.mcpConfigPath);
+      args.push("--allowedTools", ...EDIT_JOB_ALLOWED_TOOLS);
+      args.push("--disallowedTools", ...EDIT_JOB_DISALLOWED_TOOLS);
+    }
     if (sessionId) args.push("--resume", sessionId);
     if (appendSystemPrompt) args.push("--append-system-prompt", appendSystemPrompt);
     return { bin: cfg.claudeBin, args };
   }
   if (cfg.agent === "codex") {
-    return { bin: cfg.codexBin, args: ["exec", prompt] };
+    // Unlike Claude, `codex exec` has no deny-by-default: with no flags it inherits the operator's
+    // own ~/.codex/config.toml — sandbox choice, approval policy, MCP servers, hooks, web search —
+    // which is how the 2026-07-16 dogfood edited files while /health claimed read-plan
+    // (edit_mode_plan.md). Pin the whole posture EVERY turn, not just the sandbox:
+    //   --sandbox                pinned; read-only unless the operator chose ungated. Codex's
+    //                            sandbox scopes what model-run shell commands can DO, not whether
+    //                            they run — ungated on Codex is "sandboxed shell + workspace
+    //                            edits" by explicit accept-and-label decision (see the plan).
+    //   --ignore-user-config     the operator's config.toml (MCP servers, hooks, web search,
+    //                            features) never loads under the bridge; auth still uses CODEX_HOME.
+    //   -c approval_policy=never pinned, not inherited.
+    //   -c shell_environment_policy.inherit=core   model-run commands see only core env vars.
+    // Fail-closed by construction: a Codex too old for these flags exits with a usage error and
+    // the turn fails — it never falls back to an uncontained invocation.
+    const sandbox = cfg.editMode === "ungated" ? "workspace-write" : "read-only";
+    return {
+      bin: cfg.codexBin,
+      args: [
+        "exec",
+        "--sandbox", sandbox,
+        "--ignore-user-config",
+        "-c", "approval_policy=never",
+        "-c", "shell_environment_policy.inherit=core",
+        prompt,
+      ],
+    };
   }
   if (cfg.agent === "custom") {
     if (!cfg.customAgentBin) {
@@ -103,9 +166,60 @@ function agentCommand(cfg, prompt, sessionId, appendSystemPrompt) {
 // default (read/plan-only guaranteed); codex exec likewise runs without our escalation flags. A
 // CUSTOM agent's permissions are whatever the operator configured — claiming "read-plan" for it
 // would be a lie the phone then displays, so report "operator-defined" instead (§10.3).
+// "read-plan+edit-jobs" = CHAT stays read/plan-only, but this operator armed edit-capable JOBS
+// (execute_jobs_plan.md) — Claude-only, since jobs are.
 export function agentCaps(cfg) {
   if (cfg.mode !== "cli") return "n/a";
-  return cfg.agent === "custom" ? "operator-defined" : "read-plan";
+  if (cfg.agent === "custom") return "operator-defined";
+  // Ungated: turns themselves may write — a distinct caps value so /health (and the app) never
+  // label the permissive tier with a read-only-sounding string. Kept for backward compatibility
+  // now that agentCapabilities (below) carries the per-axis truth.
+  if (cfg.agent === "codex") return cfg.editMode === "ungated" ? "ungated" : "read-plan";
+  if (cfg.agent === "claude" && cfg.editMode === "ungated") return "ungated";
+  if (cfg.agent === "claude" && cfg.allowEditJobs) return "read-plan+edit-jobs";
+  return "read-plan";
+}
+
+// Structured per-axis capabilities for /health (edit_mode_plan.md, review finding #5): file-edit
+// permission and shell permission are INDEPENDENT axes — Codex runs a sandboxed shell even at
+// read-only, Claude never runs one at any tier — and one opaque string can't carry both. The app
+// prefers this object; the legacy `caps` string above stays for older clients.
+export function agentCapabilities(cfg) {
+  if (cfg.mode !== "cli") return null;
+  const editMode = cfg.editMode || "disabled";
+  if (cfg.agent === "custom") {
+    return { editMode, chatWrites: null, editJobs: false, shell: "operator-defined", snapshotPolicy: "none" };
+  }
+  const ungated = editMode === "ungated";
+  if (cfg.agent === "codex") {
+    return {
+      editMode,
+      chatWrites: ungated,
+      editJobs: false, // Codex has no jobs path (501) — the confirm-gated task tier can't arm
+      shell: ungated ? "workspace-write" : "read-only",
+      snapshotPolicy: "none",
+    };
+  }
+  return {
+    editMode,
+    chatWrites: ungated,
+    editJobs: editMode === "limited" || ungated,
+    shell: "none", // Bash is denied at every Claude tier — containment, not configuration
+    snapshotPolicy: ungated ? "per-turn-ring" : (editMode === "limited" ? "per-task" : "none"),
+  };
+}
+
+// Environment for a spawned agent, with every RIFFIN_BRIDGE_* var stripped (review finding #2):
+// the child never needs the bridge's own secrets, and for an agent with any shell surface (Codex —
+// sandboxed shell runs even read-only) an inherited env would hand the pairing bearer token and
+// TTS/LLM provider keys to model-run commands. Applied to ALL agents, Claude included — its
+// denied-Bash posture should not be the only thing between a prompt and the token.
+export function childEnv(env = process.env) {
+  const out = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (!key.startsWith("RIFFIN_BRIDGE_")) out[key] = value;
+  }
+  return out;
 }
 
 export function customAgentCapsWarning(cfg) {
@@ -140,10 +254,19 @@ export function extractResult(stdout) {
 
 // Run the CLI agent. Honors an AbortSignal so the caller can cancel on client disconnect/timeout —
 // the child is SIGKILLed and its output discarded. Resolves { text, sessionId }.
-function runAgent(cfg, prompt, signal, sessionId, appendSystemPrompt) {
+function runAgent(cfg, prompt, signal, sessionId, appendSystemPrompt, edit = null) {
   return new Promise((resolve, reject) => {
-    const { bin, args } = agentCommand(cfg, prompt, sessionId, appendSystemPrompt);
-    const child = spawn(bin, args, { cwd: cfg.cwd, env: process.env });
+    const { bin, args } = agentCommand(cfg, prompt, sessionId, appendSystemPrompt, edit);
+    // Windows: `bin` may be an npm-generated .cmd shim (no raw .exe) — resolve it to a directly
+    // spawnable target rather than shelling out (see win-shim.js for why shell:true is unsafe here).
+    const { bin: resolvedBin, prefixArgs } = resolveSpawnTarget(bin);
+    // stdin: "ignore" — a plain prompt argument is the whole input; an inherited/piped stdin left
+    // open (Node's spawn default) can make a CLI that checks for piped stdin content (observed with
+    // Codex's `exec`) block waiting for data/EOF that never arrives, until this process's own
+    // timeout kills it. No agent here needs stdin, so closing it outright is correct for all of them.
+    const child = spawn(resolvedBin, [...prefixArgs, ...args], {
+      cwd: cfg.cwd, env: childEnv(), stdio: ["ignore", "pipe", "pipe"]
+    });
     let stdout = "", stderr = "", settled = false;
 
     const finish = (fn, arg) => {
@@ -177,8 +300,9 @@ function runAgent(cfg, prompt, signal, sessionId, appendSystemPrompt) {
 
 // Produce reply text from either the HTTP LLM (Mode B proxy) or the CLI agent (Mode A). `session`
 // (from session.js) is the persistent-thread store; pass null/undefined for stateless behavior
-// (Mode B, or Codex).
-export async function generateText(cfg, messages, requestedModel, signal, session) {
+// (Mode B, or Codex). `edit` (ungated Claude chat only — see agentCommand): the caller (server.js)
+// has already taken the per-turn snapshot and prepared the containment files before passing this.
+export async function generateText(cfg, messages, requestedModel, signal, session, edit = null) {
   // Diagnostic trace (RIFFIN_BRIDGE_VERBOSE=1 only) — answers "which physical bridge/directory/
   // session actually served this turn," the exact question a cross-topic reply raises. cwd is the
   // full path here (not the redacted basename /health sends to the phone) because this is a local
@@ -223,7 +347,7 @@ export async function generateText(cfg, messages, requestedModel, signal, sessio
     log.debug("session_resume", `cwd=${cfg.cwd} session=${existingId}`);
     try {
       const { text, sessionId } = await runAgent(
-        cfg, lastUserMessage(messages), signal, existingId, appendSystemPrompt
+        cfg, lastUserMessage(messages), signal, existingId, appendSystemPrompt, edit
       );
       session.set(sessionId || existingId);
       return text;
@@ -237,7 +361,7 @@ export async function generateText(cfg, messages, requestedModel, signal, sessio
   }
   log.debug("session_fresh", `cwd=${cfg.cwd}`);
   const { text, sessionId } = await runAgent(
-    cfg, buildTurnsOnly(messages), signal, undefined, appendSystemPrompt
+    cfg, buildTurnsOnly(messages), signal, undefined, appendSystemPrompt, edit
   );
   log.debug("session_started", `cwd=${cfg.cwd} newSession=${sessionId}`);
   session.set(sessionId);

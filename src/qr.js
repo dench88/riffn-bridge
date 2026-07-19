@@ -15,6 +15,23 @@ export function pairingPayload(url, token) {
   return JSON.stringify({ v: 1, url, token });
 }
 
+// Custom-agent pairing payload (custom_agents_plan.md "QR payload spec v2"). v:2 on purpose:
+// the shipped coding-agent parser hard-requires v==1, so old app versions cleanly REJECT this
+// QR instead of mis-linking an LLM endpoint as a coding bridge. `entries` is 1..n {name, model}
+// — one scan can mint several named roster entries (the multi-persona-on-one-Ollama case).
+// `token` may be empty (link-only against a no-auth endpoint).
+export function pairingPayloadLLM(url, token, entries) {
+  return JSON.stringify({ v: 2, kind: "llm", url, token, entries });
+}
+
+// Voice pairing payload (tts_profiles_plan.md Phase 4). v:2 + kind:"tts" so neither shipped
+// parser (coding-agent requires v==1, custom-agent requires kind=="llm") can mis-consume it.
+// The URL is the BRIDGE's own /v1 root — the app completes it to /v1/audio/speech, and the
+// bridge proxies to the operator's configured TTS upstream, whose URL never leaves this machine.
+export function pairingPayloadTTS(url, token, model, defaultVoice) {
+  return JSON.stringify({ v: 2, kind: "tts", url, token, model, defaultVoice });
+}
+
 // Returns { rendered: boolean, text: string } — text is the ANSI/UTF8 QR if qrencode is available.
 function tryQrencode(payload) {
   try {
@@ -36,13 +53,18 @@ export function clearPairingFromTerminal(message) {
 }
 
 // Print the pairing block to the console. `warn` reminds the user the token is a secret.
-export function printPairing(url, token) {
-  const payload = pairingPayload(url, token);
+// opts.payload overrides the encoded payload (LLM pairing); opts.screen names the app screen
+// the user should scan from; opts.tokenNote replaces the default run-code-on-this-machine
+// warning (an LLM link grants chat access, not code execution — the default wording would
+// overstate it, but the token is still a secret when present).
+export function printPairing(url, token, opts = {}) {
+  const payload = opts.payload || pairingPayload(url, token);
+  const screen = opts.screen || "Link my machine";
   const qr = tryQrencode(payload);
 
   console.log("\n── Pair with Riffn ─────────────────────────────────────────────");
   if (qr.rendered) {
-    console.log("Scan this QR in Riffn → “Link my machine”:\n");
+    console.log(`Scan this QR in Riffn → “${screen}”:\n`);
     console.log(qr.text);
   } else {
     console.log("Scan-to-link needs the `qrencode` tool (not found). Two options:");
@@ -51,7 +73,11 @@ export function printPairing(url, token) {
     console.log("Pairing payload (contains a secret — treat like a password):");
     console.log(`  ${payload}`);
   }
-  console.log("\n⚠️  This token grants access to run code on this machine — treat it like a password.");
-  console.log("    Don’t screenshot, paste, or commit it. Rotate any time with:  riffn-bridge rotate");
+  if (opts.tokenNote !== undefined) {
+    if (opts.tokenNote) console.log(`\n${opts.tokenNote}`);
+  } else {
+    console.log("\n⚠️  This token grants access to run code on this machine — treat it like a password.");
+    console.log("    Don’t screenshot, paste, or commit it. Rotate any time with:  riffn-bridge rotate");
+  }
   console.log("────────────────────────────────────────────────────────────────\n");
 }

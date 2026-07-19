@@ -38,12 +38,40 @@ export function redactedCwd(cwd) {
   return base ? `…/${base}` : "…";
 }
 
+// Edit mode (edit_mode_plan.md): one operator control, same meaning for every agent.
+//   disabled — chat and jobs are read/plan-only (default)
+//   limited  — chat stays read-only; a voice-confirmed edit TASK may write (execute_jobs_plan.md)
+//   ungated  — the per-task confirmation gate is OFF: any turn may edit files (Codex: sandboxed
+//              shell + workspace edits, accept-and-label — see the plan's "Codex write tiers").
+//              Named for what it actually removes (the gate) — edits are permitted every turn,
+//              not performed every turn.
+// "full-access" / "always-edit" are deprecated spellings (each shipped briefly, 2026-07-16/17).
+// Legacy alias: RIFFIN_BRIDGE_ALLOW_EDIT_JOBS=1 with EDIT_MODE unset means "limited" — but ONLY
+// for Claude: that boolean was written by a Claude-only init prompt, and a hand-edited agent
+// switch must never carry an arming decision to an agent it was not made for (review finding #7).
+// Unknown values fall back to DISABLED (fail-closed) — a typo must never land on a permissive tier.
+export function resolveEditMode(env = process.env, agent = "claude") {
+  const raw = (env.RIFFIN_BRIDGE_EDIT_MODE || "").toLowerCase().trim();
+  if (raw === "full-access" || raw === "always-edit") return "ungated";
+  if (["disabled", "limited", "ungated"].includes(raw)) return raw;
+  if (raw === "" && agent === "claude" && env.RIFFIN_BRIDGE_ALLOW_EDIT_JOBS === "1") return "limited";
+  return "disabled";
+}
+
 export function readConfig() {
   const port = Number(process.env.RIFFIN_BRIDGE_PORT || 8765);
   const agent = (process.env.RIFFIN_BRIDGE_AGENT || "claude").toLowerCase();
   const llmUrl = process.env.RIFFIN_BRIDGE_LLM_URL || "";
   const ttsUrl = process.env.RIFFIN_BRIDGE_TTS_URL || "";
   const ttsCmd = process.env.RIFFIN_BRIDGE_TTS_CMD || "";
+  // Agent-bound edit mode (edit_mode_plan.md, review finding #7): init stamps WHICH agent the
+  // mode was chosen for. A hand-edited RIFFIN_BRIDGE_AGENT switch under a non-disabled mode
+  // degrades to disabled (never carry an arming decision to an agent it wasn't made for) — the
+  // mismatch flag lets the startup banner explain instead of failing silently.
+  const rawEditMode = resolveEditMode(process.env, agent);
+  const editModeAgentStamp = (process.env.RIFFIN_BRIDGE_EDIT_MODE_AGENT || "").toLowerCase().trim();
+  const editModeAgentMismatch = rawEditMode !== "disabled" && editModeAgentStamp !== "" && editModeAgentStamp !== agent;
+  const editMode = editModeAgentMismatch ? "disabled" : rawEditMode;
 
   return {
     port,
@@ -56,6 +84,12 @@ export function readConfig() {
 
     token: process.env.RIFFIN_BRIDGE_TOKEN || "",
     cwd: process.env.RIFFIN_BRIDGE_CWD || process.cwd(),
+    // Edit mode (see resolveEditMode above). `allowEditJobs` is kept as the derived boolean the
+    // jobs/server gates already consume: any tier above disabled arms the workstation half of the
+    // two-key edit-task gate. A leaked bearer token alone must never be able to unlock file writes.
+    editMode,
+    editModeAgentMismatch,
+    allowEditJobs: editMode !== "disabled",
     timeoutMs: Number(process.env.RIFFIN_BRIDGE_TIMEOUT_MS || 120_000),
     // Jobs (§13) get a much longer ceiling than a chat turn — a real agent task runs for minutes.
     jobTimeoutMs: Number(process.env.RIFFIN_BRIDGE_JOB_TIMEOUT_MS || 30 * 60_000),

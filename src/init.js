@@ -8,24 +8,32 @@ import path from "node:path";
 import readline from "node:readline";
 import { existsSync } from "node:fs";
 import { loadEnvFile, writeEnvVar, generateToken } from "./env-file.js";
-import { readConfig } from "./config.js";
+import { readConfig, resolveEditMode } from "./config.js";
 import { detect, instructions, magicDNSName } from "./tailscale.js";
 import { printPairing, clearPairingFromTerminal } from "./qr.js";
 import { startServer } from "./server.js";
+import { resolveSpawnTarget } from "./win-shim.js";
 
 function binPresent(bin) {
   // Present if the process launched at all (error is set — e.g. ENOENT — only when it can't run).
-  // A non-zero `--version` exit still counts as present.
+  // A non-zero `--version` exit still counts as present. Resolve through win-shim.js first: on
+  // Windows an npm-global install puts `bin` on PATH as a `.cmd` shim, which spawnSync can't
+  // launch directly — this check must resolve the same way the real turn-execution spawn does,
+  // or `init` would report an agent "missing" that actually runs fine (or vice versa).
   try {
-    const r = spawnSync(bin, ["--version"], { timeout: 5000, stdio: "ignore" });
+    const { bin: resolvedBin, prefixArgs } = resolveSpawnTarget(bin);
+    const r = spawnSync(resolvedBin, [...prefixArgs, "--version"], { timeout: 5000, stdio: "ignore" });
     return r.error === undefined;
   } catch {
     return false;
   }
 }
 
-// Detect one CLI agent. Preference: an explicit RIFFIN_BRIDGE_AGENT, else claude, else codex.
-function detectAgent() {
+// Detect one CLI agent. Preference: --agent flag, else an explicit RIFFIN_BRIDGE_AGENT, else
+// claude, else codex. The flag exists because env-var selection proved undiscoverable — even
+// the maintainer had to ask how to point a bridge at Codex (2026-07).
+function detectAgent(flagAgent) {
+  if (flagAgent === "claude" || flagAgent === "codex") return flagAgent;
   const explicit = (process.env.RIFFIN_BRIDGE_AGENT || "").toLowerCase();
   if (explicit === "claude" || explicit === "codex") return explicit;
   if (binPresent(process.env.RIFFIN_BRIDGE_CLAUDE_BIN || "claude")) return "claude";
@@ -33,8 +41,50 @@ function detectAgent() {
   return null;
 }
 
+// Parse `--agent <name>` / `--agent=<name>` from argv. Returns lowercased value or null.
+// Exits loudly on an unsupported value — a typo silently falling back to detection would
+// pair the phone to the wrong agent.
+function parseAgentFlag(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    let value = null;
+    if (argv[i] === "--agent") value = argv[i + 1] ?? "";
+    else if (argv[i].startsWith("--agent=")) value = argv[i].slice("--agent=".length);
+    if (value === null) continue;
+    const agent = value.toLowerCase();
+    if (agent !== "claude" && agent !== "codex") {
+      console.error(`✖ Unsupported --agent '${value}' (expected 'claude' or 'codex').`);
+      console.error("  For any other CLI, set RIFFIN_BRIDGE_AGENT=custom with RIFFIN_BRIDGE_AGENT_BIN/_ARGS.");
+      process.exit(1);
+    }
+    return agent;
+  }
+  return null;
+}
+
+// Parse `--edit-mode <tier>` / `--edit-mode=<tier>` (edit_mode_plan.md). Skips the interactive
+// 3-way prompt; the ungated typed acknowledgement is NEVER skipped (see the 2b block). Exits
+// loudly on an unsupported value — same fail-closed posture as --agent (a typo must not fall
+// through to a prompt the operator thinks they already answered). Deprecated spellings are
+// rejected here rather than aliased: the flag is new, so there's no muscle memory to honor.
+function parseEditModeFlag(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    let value = null;
+    if (argv[i] === "--edit-mode") value = argv[i + 1] ?? "";
+    else if (argv[i].startsWith("--edit-mode=")) value = argv[i].slice("--edit-mode=".length);
+    if (value === null) continue;
+    const mode = value.toLowerCase();
+    if (!["disabled", "limited", "ungated"].includes(mode)) {
+      console.error(`✖ Unsupported --edit-mode '${value}' (expected 'disabled', 'limited', or 'ungated').`);
+      process.exit(1);
+    }
+    return mode;
+  }
+  return null;
+}
+
 // Probe up to 10 ports starting at `startPort` and return the first that binds on `host`.
-function findFreePort(host, startPort) {
+// Exported for init-llm.js (the `init --llm` wizard shares the port/prompt plumbing).
+export function findFreePort(host, startPort) {
   const tryPort = (port) => new Promise((resolve) => {
     const probe = net.createServer();
     probe.once("error", () => resolve(false));
@@ -49,7 +99,7 @@ function findFreePort(host, startPort) {
   })();
 }
 
-function ask(question, def) {
+export function ask(question, def) {
   if (!process.stdin.isTTY) return Promise.resolve(def); // non-interactive → accept defaults
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
@@ -61,20 +111,32 @@ function ask(question, def) {
 }
 
 export async function runInit(argv) {
+  // `init --llm [url]` / `init --openclaw` — the Custom Agents wizard (custom_agents_plan.md
+  // "One-click linking") lives in its own module; everything below is the coding-agent path.
+  if (argv.includes("--openclaw") || argv.some((a) => a === "--llm" || a.startsWith("--llm="))) {
+    const { runInitLLM } = await import("./init-llm.js");
+    return runInitLLM(argv);
+  }
+
   const yes = argv.includes("--yes") || argv.includes("-y");
   const envPath = path.join(process.cwd(), ".env");
   loadEnvFile(envPath);
 
   console.log("\nriffn-bridge init — link this machine to Riffn (read/plan-only, Tailscale).\n");
 
-  // 1. Agent
-  const agent = detectAgent();
+  // 1. Agent — `--agent codex` overrides detection (and persists, so plain `start` keeps it).
+  const flagAgent = parseAgentFlag(argv);
+  const agent = detectAgent(flagAgent);
   if (!agent) {
     console.error("✖ No agent found. Install Claude Code (`claude`) or Codex (`codex`) and re-run.");
     console.error("  (Local-LLM/TTS proxy mode is a later phase; this cut drives a CLI agent.)");
     process.exit(1);
   }
-  console.log(`✓ Detected agent: ${agent}`);
+  if (flagAgent && !binPresent(flagAgent === "claude" ? (process.env.RIFFIN_BRIDGE_CLAUDE_BIN || "claude") : (process.env.RIFFIN_BRIDGE_CODEX_BIN || "codex"))) {
+    console.error(`✖ --agent ${flagAgent} requested but the '${flagAgent}' CLI isn't on PATH.`);
+    process.exit(1);
+  }
+  console.log(flagAgent ? `✓ Agent (from --agent): ${agent}` : `✓ Detected agent: ${agent}`);
   writeEnvVar(envPath, "RIFFIN_BRIDGE_AGENT", agent);
 
   // 2. Working directory the agent operates in
@@ -86,6 +148,84 @@ export async function runInit(argv) {
   }
   writeEnvVar(envPath, "RIFFIN_BRIDGE_CWD", cwd);
   console.log(`✓ Working directory: ${cwd}`);
+
+  // 2b. Edit mode (edit_mode_plan.md) — the workstation half of the arming; the phone's spoken
+  // confirm (limited tier) is the other half. NEVER escalated silently: `--yes` and non-TTY runs
+  // keep the existing value AND SAY SO (the silent skip bit a real operator once, 2026-07-16);
+  // choosing ungated requires typing an exact acknowledgement, and a botched attempt lands on
+  // disabled — never on a middle tier the operator didn't pick.
+  {
+    const current = resolveEditMode(process.env, agent);
+    const flagMode = parseEditModeFlag(argv);
+    let editMode = current;
+    if (flagMode !== null) {
+      editMode = flagMode;
+    } else if (!yes && process.stdin.isTTY) {
+      console.log(
+        "\nEdit capability for this bridge:\n" +
+        "  1) disabled — read/plan-only (recommended default)\n" +
+        "  2) limited  — chat stays read-only; a voice-confirmed task (\"execute the plan\") may\n" +
+        "                edit files, snapshotted first" + (agent === "claude" ? "" : " (Claude only — arms nothing on this agent)") + "\n" +
+        "  3) ungated  — the confirmation gate is OFF: any message may edit files immediately"
+      );
+      const def = current === "ungated" ? "3" : current === "limited" ? "2" : "1";
+      const choice = ((await ask("Choice (1/2/3)", def)) || "").trim();
+      editMode = choice === "3" ? "ungated" : choice === "2" ? "limited" : "disabled";
+    } else {
+      console.log(`(non-interactive: keeping existing edit-mode '${current}')`);
+    }
+    // The ungated acknowledgement is NEVER skipped — not by --edit-mode, not by --yes. Arming
+    // the most permissive tier requires a human typing the exact phrase at this terminal; a
+    // non-TTY/scripted run requesting ungated keeps the EXISTING mode (loudly) rather than
+    // either arming silently or downgrading a setting the operator already confirmed once.
+    if (editMode === "ungated" && current !== "ungated") {
+      if (!process.stdin.isTTY) {
+        console.warn("⚠️  --edit-mode ungated needs an interactive terminal for the typed acknowledgement —");
+        console.warn(`    keeping existing edit-mode '${current}'. Re-run init in a real terminal to enable it.`);
+        editMode = current;
+      } else {
+        console.log(
+          "\n⚠️  UNGATED means every message from a paired phone can edit files in this repo — no\n" +
+          "    per-task confirmation, no \"execute the plan\" gate. Anyone holding your phone, or\n" +
+          "    anyone who obtains a leaked pairing token, can modify code here at will." +
+          (agent === "codex"
+            ? "\n    On Codex this also means SANDBOXED SHELL: model-run commands execute, contained\n" +
+              "    to the working directory. No automatic snapshots — rely on your own git discipline."
+            : "\n    Command execution and git stay denied. Every write-capable turn snapshots the repo\n" +
+              "    first (refs/riffn/ring-*, last ~20 kept).")
+        );
+        const ack = ((await ask('Type "yes i understand" to enable, anything else to cancel', "")) || "").trim().toLowerCase();
+        if (ack !== "yes i understand") {
+          editMode = "disabled";
+          console.log("✓ Not enabled — edit mode set to disabled.");
+        }
+      }
+    }
+    writeEnvVar(envPath, "RIFFIN_BRIDGE_EDIT_MODE", editMode);
+    // Agent stamp (review finding #7): the mode was chosen FOR this agent; a hand-edited agent
+    // switch degrades to disabled until re-confirmed here (see readConfig's mismatch check).
+    writeEnvVar(envPath, "RIFFIN_BRIDGE_EDIT_MODE_AGENT", agent);
+    // Keep the legacy boolean in sync so an older bridge build reading this .env agrees.
+    writeEnvVar(envPath, "RIFFIN_BRIDGE_ALLOW_EDIT_JOBS", editMode === "disabled" ? "0" : "1");
+    process.env.RIFFIN_BRIDGE_EDIT_MODE = editMode;
+    process.env.RIFFIN_BRIDGE_EDIT_MODE_AGENT = agent;
+    process.env.RIFFIN_BRIDGE_ALLOW_EDIT_JOBS = editMode === "disabled" ? "0" : "1";
+    const label = editMode === "ungated" ? "UNGATED — any turn may edit files"
+      : editMode === "limited" ? "limited (voice-confirmed edit tasks)"
+      : "disabled (read/plan-only)";
+    console.log(`✓ Edit mode: ${label} (saved to .env — RIFFIN_BRIDGE_EDIT_MODE).`);
+    if (editMode !== "disabled" && agent === "claude") {
+      // Snapshots refuse to run outside a git repo — surface that now, not mid-commute.
+      const inRepo = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, encoding: "utf8" });
+      if (inRepo.error || inRepo.status !== 0 || inRepo.stdout.trim() !== "true") {
+        console.warn(
+          "⚠️  The working directory is NOT a git repository (or git isn't installed). Write-capable\n" +
+          "    turns/tasks will be refused there — the pre-write snapshot has nowhere to go. Run\n" +
+          "    `git init` or pick a repo directory if you want edits to actually run."
+        );
+      }
+    }
+  }
 
   // 3. Token (keep an existing one; otherwise generate + persist)
   let token = process.env.RIFFIN_BRIDGE_TOKEN;

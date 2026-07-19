@@ -28,6 +28,9 @@ zero runtime dependencies. Details are in the README's security section.
 - The agent runs with the permissions the operator configured. Reports that the agent can do
   what the operator allowed it to do are not vulnerabilities; reports that it can do MORE than
   that absolutely are.
+- The write-path boundary (edit tasks may only write inside the working directory) is lexical
+  containment against a confused agent, not a kernel sandbox: escapes via symlinks/junctions
+  inside the repo are an accepted, documented residual in v1.
 
 ## Supported versions
 

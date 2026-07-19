@@ -5,10 +5,11 @@ import http from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { MAX_BODY_BYTES, VERSION, redactedCwd } from "./config.js";
 import { log, errorType, warnVerboseIfEnabled } from "./log.js";
-import { generateText, agentCaps, customAgentCapsWarning, extractSystemPrompt } from "./agent.js";
+import { generateText, agentCaps, agentCapabilities, customAgentCapsWarning, effectiveCaps, extractSystemPrompt } from "./agent.js";
+import { snapshotRepoRing, SNAPSHOT_RING_SIZE } from "./git.js";
 import { synthesize, mimeForFormat } from "./tts.js";
 import { createSessionStore, peekRaw as peekRawSession } from "./session.js";
-import { createJobStore } from "./jobs.js";
+import { createJobStore, SnapshotError } from "./jobs.js";
 import { saveNote } from "./notes.js";
 
 function send(res, status, obj) {
@@ -110,8 +111,10 @@ export function startServer(cfg) {
   let firstAuthSeen = false;
 
   // Persistent agent session ("one thread per machine", §9 #5) — Claude-only (see agent.js).
+  // Mode-stamped (edit_mode_plan.md): a session only resumes under the edit mode it was created
+  // with, so flipping RIFFIN_BRIDGE_EDIT_MODE and restarting starts a fresh thread automatically.
   const session = cfg.mode === "cli" && cfg.agent === "claude"
-    ? createSessionStore(cfg.envDir, cfg.cwd)
+    ? createSessionStore(cfg.envDir, cfg.cwd, cfg.editMode)
     : null;
 
   // Durable jobs (§13) — Claude-only (needs stream-json progress). Shares the session store so a
@@ -176,7 +179,10 @@ export function startServer(cfg) {
         // hostname (§10.10). Absent when TTS isn't configured.
         ttsModel: cfg.ttsConfigured ? cfg.ttsModel : undefined,
         ttsVoice: cfg.ttsConfigured ? cfg.ttsVoice : undefined,
-        caps: agentCaps(cfg),                              // read-plan | operator-defined (§10.3/§12)
+        caps: agentCaps(cfg),                              // legacy string — kept for older clients
+        // Structured per-axis capabilities (edit_mode_plan.md): editMode / chatWrites / editJobs /
+        // shell / snapshotPolicy. The app prefers this and falls back to `caps` when absent.
+        capabilities: agentCapabilities(cfg) ?? undefined,
         sessionActive: Boolean(session?.get()),            // persistent thread already established?
         jobs: Boolean(jobs),                               // does this bridge support §13 jobs?
         notes: true,                                       // POST /v1/notes (helper-written riffn-notes/)
@@ -209,9 +215,24 @@ export function startServer(cfg) {
         const ac = new AbortController();
         res.on("close", () => { if (!res.writableFinished) ac.abort(); });
 
+        // Ungated Claude (edit_mode_plan.md): the chat path is only the fallback for non-jobs
+        // clients, but permissions must derive identically on both paths (review finding #3) —
+        // a turn arriving here is as write-capable as the same turn dispatched as a job. Same
+        // fail-closed pair as jobs.start: containment files + ring snapshot, or the turn refuses.
+        let editChat = null;
+        if (effectiveCaps(cfg, undefined) === "ungated" && jobs) {
+          try {
+            editChat = jobs.editConfigs();
+            snapshotRepoRing(cfg.cwd);
+          } catch (err) {
+            log.error("ungated_chat_refused", err);
+            return sendError(res, 503, "Couldn't snapshot the repo before this turn, so it wasn't run. Check git on that machine.");
+          }
+        }
+
         inFlight = true;
         try {
-          const text = await generateText(cfg, messages, body?.model, ac.signal, session);
+          const text = await generateText(cfg, messages, body?.model, ac.signal, session, editChat);
           if (res.writableEnded) return;
           // The app always requests stream:true → emit SSE so its existing streaming path consumes
           // the reply unchanged. Plain (non-stream) callers get a normal JSON completion.
@@ -276,13 +297,34 @@ export function startServer(cfg) {
         return readJsonBody(req, res, (body) => {
           const messages = Array.isArray(body?.messages) ? body.messages : null;
           if (!messages || messages.length === 0) return sendError(res, 400, "`messages` must be a non-empty array.");
+          // Edit-capable jobs (execute_jobs_plan.md): the phone must ask explicitly (caps:"edit")
+          // AND the workstation must have armed it at init — two keys. Errors are speakable: the
+          // app reads them out verbatim on the commute.
+          const requestedCaps = body?.caps === "edit" ? "edit" : undefined;
+          if (requestedCaps && !cfg.allowEditJobs) {
+            return sendError(res, 403, "This machine hasn't enabled edit tasks — run riffn-bridge init on it to allow them.");
+          }
+          // Central derivation (edit_mode_plan.md): under ungated, EVERY job turn is write-capable
+          // (requested or not) with resumable-session + ring-snapshot semantics; under limited, only
+          // an explicit caps:"edit" request gets the fresh-session per-task edit path.
+          const caps = effectiveCaps(cfg, requestedCaps) === "read" ? undefined : effectiveCaps(cfg, requestedCaps);
           // Flatten to a single prompt (a job is a one-shot dispatch, resumed thread aside), and pass
           // system content via --append-system-prompt exactly like chat turns.
           const prompt = messages.filter((m) => m.role !== "system")
             .map((m) => (m.role === "assistant" ? "Assistant: " : "User: ") +
               (typeof m.content === "string" ? m.content : ""))
             .join("\n\n");
-          const view = jobs.start(prompt, extractSystemPrompt(messages));
+          let view;
+          try {
+            view = jobs.start(prompt, extractSystemPrompt(messages), caps);
+          } catch (err) {
+            // Snapshot failure REFUSES the job (invariant 3) — a write-enabled run without its
+            // undo point must never start. 503: the machine is fine, this dispatch isn't.
+            if (err instanceof SnapshotError) {
+              return sendError(res, 503, "Couldn't snapshot the repo before the edit task, so it wasn't started. Check git on that machine.");
+            }
+            throw err;
+          }
           if (!view) return sendError(res, 409, "A job is already running.");
           return send(res, 202, { job: view });
         });
@@ -348,7 +390,11 @@ export function startServer(cfg) {
 
   server.listen(cfg.port, cfg.host, () => {
     warnVerboseIfEnabled();
-    const capsLabel = agentCaps(cfg) === "read-plan" ? "read/plan-only" : agentCaps(cfg);
+    const caps = agentCaps(cfg);
+    const capsLabel = caps === "read-plan" ? "read/plan-only"
+      : caps === "read-plan+edit-jobs" ? "read/plan chat + EDIT-capable jobs (voice-approved)"
+      : caps === "ungated" ? "UNGATED — any turn may edit files, no confirmation gate"
+      : caps;
     const agentLabel = cfg.agent === "custom" ? `custom '${cfg.customAgentBin}'` : `'${cfg.agent}'`;
     console.log(`riffn-bridge v${VERSION} listening on http://${cfg.host}:${cfg.port}  (pid ${process.pid})`);
     console.log(`  mode: ${cfg.mode === "cli" ? `CLI agent ${agentLabel}` : "HTTP LLM proxy"}   caps: ${capsLabel}`);
@@ -356,6 +402,40 @@ export function startServer(cfg) {
     console.log(`  note: this bridge executes an agent on YOUR machine; you control its permissions — run at your own risk.`);
     const capsWarning = customAgentCapsWarning(cfg);
     if (capsWarning) console.warn(capsWarning);
+    if (caps === "read-plan+edit-jobs") {
+      console.warn(
+        `⚠️  Edit tasks ENABLED (RIFFIN_BRIDGE_ALLOW_EDIT_JOBS=1): a voice-confirmed task from a\n` +
+        `    paired phone may EDIT FILES under the agent cwd above (still no command execution,\n` +
+        `    no git). A snapshot ref (refs/riffn/snapshot-*) is taken before every edit task.`
+      );
+    }
+    if (caps === "ungated") {
+      const perAgent = cfg.agent === "codex"
+        ? `    On Codex this tier is SANDBOXED SHELL + WORKSPACE EDITS: model-run commands execute,\n` +
+          `    contained to that directory (accept-and-label — edit_mode_plan.md). No automatic\n` +
+          `    snapshots are taken — rely on your own git discipline.\n`
+        : `    On Claude, edits are contained (no commands, no git, no MCP) and every write-capable\n` +
+          `    turn snapshots the repo first (refs/riffn/ring-*, last ${SNAPSHOT_RING_SIZE} kept).\n`;
+      console.warn(
+        `🚨 UNGATED (RIFFIN_BRIDGE_EDIT_MODE=ungated): ANY message from a paired phone may edit\n` +
+        `    files under the agent cwd above — no per-task confirmation, no "execute the plan"\n` +
+        `    gate. Anyone holding your phone, or a leaked pairing token, can modify code here at\n` +
+        `    will.\n` + perAgent +
+        `    Set RIFFIN_BRIDGE_EDIT_MODE=disabled (or remove it) in .env to revert.`
+      );
+    }
+    const rawEditMode = (process.env.RIFFIN_BRIDGE_EDIT_MODE || "").toLowerCase().trim();
+    if (rawEditMode === "full-access" || rawEditMode === "always-edit") {
+      console.warn(`    (RIFFIN_BRIDGE_EDIT_MODE=${rawEditMode} is a deprecated spelling — use ungated.)`);
+    }
+    if (cfg.editModeAgentMismatch) {
+      console.warn(
+        `⚠️  RIFFIN_BRIDGE_EDIT_MODE was chosen for agent '${(process.env.RIFFIN_BRIDGE_EDIT_MODE_AGENT || "").trim()}',\n` +
+        `    but this bridge is running '${cfg.agent}' — edit mode DEGRADED to disabled. An arming\n` +
+        `    decision never carries across agents; re-run \`riffn-bridge init\` to choose a mode for\n` +
+        `    this agent.`
+      );
+    }
     // Full, unredacted paths here are fine — this is the operator's own terminal, not the wire to
     // the phone. Printed on EVERY start (not just verbose) because "which folder is this bridge
     // actually running in / launched from" is exactly the question that's hard to answer once you
