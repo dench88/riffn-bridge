@@ -328,3 +328,27 @@ link, trust, talk (read/plan-only), over Tailscale.
 - **429 busy** — a turn is already in flight; the bridge serves one turn at a time.
 - **Agent error** — run `claude -p "hello" --output-format json` by hand in your working directory to
   see the real error, or set `RIFFIN_BRIDGE_VERBOSE=1` for the message.
+
+## Releasing (maintainers)
+
+The source of truth is `tools/riffin-bridge` in the riffin monorepo; the standalone
+`riffn-bridge` GitHub repo is a **write-only publish mirror** (it exists so CI can publish to
+npm without dragging the app monorepo along). Never publish any other way — versions 0.3–0.5
+were once published around the mirror and it silently fell months behind.
+
+1. Bump `version` in the monorepo's `tools/riffin-bridge/package.json` (only ever bump it there).
+2. Sync the mirror: `tools\riffin-bridge\sync-bridge.ps1` — a robocopy `/MIR` of the source set;
+   local state (`.env`, logs, session/job files, `node_modules`, `.git`) is never copied or
+   deleted on either side.
+3. In the mirror checkout: `npm test`, review `git status` (that diff IS the release), then
+
+   ```powershell
+   git add -A
+   git commit -m "riffn-bridge X.Y.Z"
+   git tag vX.Y.Z
+   git push origin main --tags
+   ```
+
+The tag push triggers `.github/workflows/publish.yml`, which refuses to publish unless the tag
+matches `package.json`'s version — so a forgotten sync or bump fails loudly instead of shipping
+a stale package.

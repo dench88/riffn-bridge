@@ -33,6 +33,9 @@ jobs:
         run: |
           node -e "if (require('./package.json').private) { console.error('package.json still has \"private\": true — the §10.5 gate ceremony removes it deliberately.'); process.exit(1); }"
 
+      # Trusted-publishing (OIDC) auth needs npm >= 11.5; Node 20 ships npm 10, which fails
+      # with ENEEDAUTH. No NODE_AUTH_TOKEN: the id-token permission + npm Trusted Publisher
+      # config (repo dench88/riffn-bridge, workflow publish.yml) carries authentication.
+      - run: npm install -g npm@latest
+
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
