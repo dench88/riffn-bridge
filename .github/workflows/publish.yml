@@ -19,10 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No registry-url: that would write an .npmrc expecting ${NODE_AUTH_TOKEN}, which breaks
+      # every npm command under OIDC (no token exists by design; publish targets npmjs by default).
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          registry-url: "https://registry.npmjs.org"
 
       - name: Tag must match package.json version
         run: |
