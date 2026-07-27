@@ -14,7 +14,11 @@
 // Fail-CLOSED: any malformed input, parse error, or unexpected shape → DENY. A hook that can't
 // understand the request must not let it through.
 
-import { isEditToolAllowed, isEditPathAllowed } from "./edit-policy.js";
+import { isEditToolAllowed, isEditPathAllowed, isReadToolAllowed } from "./edit-policy.js";
+import { fileURLToPath } from "node:url";
+
+const readOnly = process.argv[2] === "read";
+const bridgePackageRoot = fileURLToPath(new URL("..", import.meta.url));
 
 function deny(reason) {
   process.stdout.write(JSON.stringify({
@@ -49,21 +53,29 @@ process.stdin.on("end", () => {
   if (typeof toolName !== "string" || !toolName) {
     return deny("edit-task tool guard: missing tool name");
   }
-  if (!isEditToolAllowed(toolName)) {
+  const toolAllowed = readOnly ? isReadToolAllowed(toolName) : isEditToolAllowed(toolName);
+  if (!toolAllowed) {
     return deny(
-      `Edit tasks may only read and edit files (and search the web) — the '${toolName}' tool is ` +
-      `blocked. Command execution, git, subagents, and external services are not available in an ` +
-      `edit task.`
+      `${readOnly ? "Read-only turns" : "Edit tasks"} may only use their pinned file/web tools — ` +
+      `the '${toolName}' tool is blocked. Command execution, git, subagents, and external ` +
+      `services are unavailable.`
     );
   }
-  // Second gate, write tools only: the target must live inside the working directory. Needed
-  // because our explicit allow below bypasses Claude Code's own outside-cwd permission check.
+  // Second gate: every file target must live inside the working directory, reads of secret files
+  // are denied, and writes to host-consumed automation paths are denied. Needed because our
+  // explicit allow below bypasses Claude Code's own outside-cwd permission check.
   // The hook payload's `cwd` is the session's working directory (= the repo the bridge pinned);
   // fall back to the hook process's own cwd, which Claude Code also runs in the session dir.
-  if (!isEditPathAllowed(toolName, input?.tool_input, input?.cwd || process.cwd())) {
+  if (!isEditPathAllowed(
+    toolName,
+    input?.tool_input,
+    input?.cwd || process.cwd(),
+    { protectedRoots: [bridgePackageRoot] }
+  )) {
     return deny(
-      `Edit tasks may only write files inside the working directory — that '${toolName}' target ` +
-      `is outside it (or missing). Work within the repo the bridge is pointed at.`
+      `${readOnly ? "Read-only turns" : "Edit tasks"} may only access permitted paths inside ` +
+      `the working directory — that ` +
+      `'${toolName}' target is outside it, missing, secret, or protected from writes.`
     );
   }
   return allow();

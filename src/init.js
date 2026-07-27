@@ -13,6 +13,10 @@ import { detect, instructions, magicDNSName } from "./tailscale.js";
 import { printPairing, clearPairingFromTerminal } from "./qr.js";
 import { startServer } from "./server.js";
 import { resolveSpawnTarget } from "./win-shim.js";
+import { assertDirectCodexEnabled } from "./codex-policy.js";
+import {
+  assertNoLegacyEnv, assertStateOutsideWorkspace, ensureStateDir, resolveStateDir,
+} from "./state.js";
 
 function binPresent(bin) {
   // Present if the process launched at all (error is set — e.g. ENOENT — only when it can't run).
@@ -29,15 +33,14 @@ function binPresent(bin) {
   }
 }
 
-// Detect one CLI agent. Preference: --agent flag, else an explicit RIFFIN_BRIDGE_AGENT, else
-// claude, else codex. The flag exists because env-var selection proved undiscoverable — even
-// the maintainer had to ask how to point a bridge at Codex (2026-07).
+// Detect one CLI agent. Direct Codex is deliberately not auto-detected while its native-Windows
+// shell can bypass read denials. An explicit Codex choice is returned only so the policy gate can
+// produce the precise refusal; the supported automatic path is Claude Code.
 function detectAgent(flagAgent) {
   if (flagAgent === "claude" || flagAgent === "codex") return flagAgent;
   const explicit = (process.env.RIFFIN_BRIDGE_AGENT || "").toLowerCase();
   if (explicit === "claude" || explicit === "codex") return explicit;
   if (binPresent(process.env.RIFFIN_BRIDGE_CLAUDE_BIN || "claude")) return "claude";
-  if (binPresent(process.env.RIFFIN_BRIDGE_CODEX_BIN || "codex")) return "codex";
   return null;
 }
 
@@ -119,19 +122,34 @@ export async function runInit(argv) {
   }
 
   const yes = argv.includes("--yes") || argv.includes("-y");
-  const envPath = path.join(process.cwd(), ".env");
+  const cwdFlagIndex = argv.indexOf("--cwd");
+  const cwdFlag = cwdFlagIndex >= 0 ? argv[cwdFlagIndex + 1] : null;
+  const defaultCwd = path.resolve(cwdFlag || process.env.RIFFIN_BRIDGE_CWD || process.cwd());
+  const cwd = path.resolve(cwdFlag || (yes ? defaultCwd : await ask("Working directory for the agent", defaultCwd)));
+  if (!existsSync(cwd)) {
+    console.error(`Directory does not exist: ${cwd}`);
+    process.exit(1);
+  }
+  const stateDir = resolveStateDir(cwd);
+  assertStateOutsideWorkspace(stateDir, cwd);
+  assertNoLegacyEnv(process.cwd(), stateDir);
+  ensureStateDir(stateDir);
+  process.env.RIFFIN_BRIDGE_STATE_DIR = stateDir;
+  const envPath = path.join(stateDir, ".env");
   loadEnvFile(envPath);
+  process.env.RIFFIN_BRIDGE_CWD = cwd;
 
   console.log("\nriffn-bridge init — link this machine to Riffn (read/plan-only, Tailscale).\n");
 
-  // 1. Agent — `--agent codex` overrides detection (and persists, so plain `start` keeps it).
+  // 1. Agent — direct Codex is recognized only to fail closed with the decision-of-record reason.
   const flagAgent = parseAgentFlag(argv);
   const agent = detectAgent(flagAgent);
   if (!agent) {
-    console.error("✖ No agent found. Install Claude Code (`claude`) or Codex (`codex`) and re-run.");
+    console.error("✖ No supported agent found. Install Claude Code (`claude`) and re-run.");
     console.error("  (Local-LLM/TTS proxy mode is a later phase; this cut drives a CLI agent.)");
     process.exit(1);
   }
+  if (agent === "codex") assertDirectCodexEnabled();
   if (flagAgent && !binPresent(flagAgent === "claude" ? (process.env.RIFFIN_BRIDGE_CLAUDE_BIN || "claude") : (process.env.RIFFIN_BRIDGE_CODEX_BIN || "codex"))) {
     console.error(`✖ --agent ${flagAgent} requested but the '${flagAgent}' CLI isn't on PATH.`);
     process.exit(1);
@@ -140,13 +158,12 @@ export async function runInit(argv) {
   writeEnvVar(envPath, "RIFFIN_BRIDGE_AGENT", agent);
 
   // 2. Working directory the agent operates in
-  const defaultCwd = process.env.RIFFIN_BRIDGE_CWD || process.cwd();
-  const cwd = yes ? defaultCwd : await ask("Working directory for the agent", defaultCwd);
   if (!existsSync(cwd)) {
     console.error(`✖ Directory does not exist: ${cwd}`);
     process.exit(1);
   }
   writeEnvVar(envPath, "RIFFIN_BRIDGE_CWD", cwd);
+  console.log(`Bridge state: ${stateDir} (outside the agent workspace).`);
   console.log(`✓ Working directory: ${cwd}`);
 
   // 2b. Edit mode (edit_mode_plan.md) — the workstation half of the arming; the phone's spoken
@@ -189,8 +206,8 @@ export async function runInit(argv) {
           "    per-task confirmation, no \"execute the plan\" gate. Anyone holding your phone, or\n" +
           "    anyone who obtains a leaked pairing token, can modify code here at will." +
           (agent === "codex"
-            ? "\n    On Codex this also means SANDBOXED SHELL: model-run commands execute, contained\n" +
-              "    to the working directory. No automatic snapshots — rely on your own git discipline."
+            ? "\n    On Codex this means a PINNED WRITE PROFILE + COMMAND SHELL. Secret and\n" +
+              "    automation paths stay protected; every turn is snapshotted and audited."
             : "\n    Command execution and git stay denied. Every write-capable turn snapshots the repo\n" +
               "    first (refs/riffn/ring-*, last ~20 kept).")
         );
@@ -252,7 +269,7 @@ export async function runInit(argv) {
   process.env.RIFFIN_BRIDGE_TOKEN = token;
   process.env.RIFFIN_BRIDGE_CWD = cwd;
   process.env.RIFFIN_BRIDGE_AGENT = agent;
-  const cfg = readConfig();
+  const cfg = readConfig({ codexPolicyMode: agent === "codex" ? "enforce" : "skip" });
   cfg.host = cfg.host || ts.ip; // bind to the numeric tailnet IP
 
   // 5b. Port: a multi-agent fleet on one box is the normal case (§12), and every bridge defaults

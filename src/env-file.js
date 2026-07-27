@@ -2,7 +2,8 @@
 // We avoid `dotenv` on purpose — zero runtime dependencies is a stated supply-chain control
 // (bridge_plan.md §10.5). This parser is intentionally small and only supports `KEY=value` lines.
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import pathModule from "node:path";
 import { randomBytes } from "node:crypto";
 
 // Parse a .env file into [ {key, value} ] preserving nothing fancy (no export, no interpolation).
@@ -36,6 +37,7 @@ export function loadEnvFile(path) {
 
 // Write (or replace) a single KEY=value in the .env file, preserving other lines and comments.
 export function writeEnvVar(path, key, value) {
+  mkdirSync(pathModule.dirname(path), { recursive: true, mode: 0o700 });
   const lines = existsSync(path) ? readFileSync(path, "utf8").split(/\r?\n/) : [];
   const rendered = `${key}=${value}`;
   let replaced = false;

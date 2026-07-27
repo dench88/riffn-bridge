@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import {
+  CODEX_READ_PROFILE, CODEX_WRITE_PROFILE, enforceCodexPolicy, inspectCodexPolicy,
+} from "./codex-policy.js";
+import { assertStateOutsideWorkspace, resolveStateDir } from "./state.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -38,11 +42,24 @@ export function redactedCwd(cwd) {
   return base ? `…/${base}` : "…";
 }
 
+export function codexPolicyHealth(cfg) {
+  if (cfg.mode !== "cli" || cfg.agent !== "codex") return undefined;
+  const dormantProfile = cfg.editMode === "ungated" ? CODEX_WRITE_PROFILE : CODEX_READ_PROFILE;
+  return {
+    status: cfg.codexPolicy?.status || "not-checked",
+    ready: Boolean(cfg.codexPolicy?.ready),
+    version: cfg.codexPolicy?.version || null,
+    versionOutput: cfg.codexPolicy?.output || null,
+    detail: cfg.codexPolicy?.detail || null,
+    profile: cfg.codexPolicy?.ready ? dormantProfile : null,
+    dormantProfile,
+  };
+}
+
 // Edit mode (edit_mode_plan.md): one operator control, same meaning for every agent.
 //   disabled — chat and jobs are read/plan-only (default)
 //   limited  — chat stays read-only; a voice-confirmed edit TASK may write (execute_jobs_plan.md)
-//   ungated  — the per-task confirmation gate is OFF: any turn may edit files (Codex: sandboxed
-//              shell + workspace edits, accept-and-label — see the plan's "Codex write tiers").
+//   ungated  — the per-task confirmation gate is OFF: any Claude turn may edit files.
 //              Named for what it actually removes (the gate) — edits are permitted every turn,
 //              not performed every turn.
 // "full-access" / "always-edit" are deprecated spellings (each shipped briefly, 2026-07-16/17).
@@ -58,12 +75,15 @@ export function resolveEditMode(env = process.env, agent = "claude") {
   return "disabled";
 }
 
-export function readConfig() {
+export function readConfig({ codexPolicyMode = "enforce" } = {}) {
   const port = Number(process.env.RIFFIN_BRIDGE_PORT || 8765);
   const agent = (process.env.RIFFIN_BRIDGE_AGENT || "claude").toLowerCase();
   const llmUrl = process.env.RIFFIN_BRIDGE_LLM_URL || "";
   const ttsUrl = process.env.RIFFIN_BRIDGE_TTS_URL || "";
   const ttsCmd = process.env.RIFFIN_BRIDGE_TTS_CMD || "";
+  const cwd = path.resolve(process.env.RIFFIN_BRIDGE_CWD || process.cwd());
+  const envDir = resolveStateDir(cwd);
+  assertStateOutsideWorkspace(envDir, cwd);
   // Agent-bound edit mode (edit_mode_plan.md, review finding #7): init stamps WHICH agent the
   // mode was chosen for. A hand-edited RIFFIN_BRIDGE_AGENT switch under a non-disabled mode
   // degrades to disabled (never carry an arming decision to an agent it wasn't made for) — the
@@ -73,17 +93,15 @@ export function readConfig() {
   const editModeAgentMismatch = rawEditMode !== "disabled" && editModeAgentStamp !== "" && editModeAgentStamp !== agent;
   const editMode = editModeAgentMismatch ? "disabled" : rawEditMode;
 
-  return {
+  const cfg = {
     port,
     host: process.env.RIFFIN_BRIDGE_HOST || tailscaleIPv4(),
     allowPublic: process.env.RIFFIN_BRIDGE_ALLOW_PUBLIC === "1",
-    // Directory the helper was launched from — where .env and the persistent session file live.
-    // (Distinct from `cwd` below, which is the AGENT's working directory, e.g. the repo it reasons
-    // about.)
-    envDir: process.cwd(),
+    // Project-keyed state outside the agent workspace: .env, sessions, audits, and probe records.
+    envDir,
 
     token: process.env.RIFFIN_BRIDGE_TOKEN || "",
-    cwd: process.env.RIFFIN_BRIDGE_CWD || process.cwd(),
+    cwd,
     // Edit mode (see resolveEditMode above). `allowEditJobs` is kept as the derived boolean the
     // jobs/server gates already consume: any tier above disabled arms the workstation half of the
     // two-key edit-task gate. A leaked bearer token alone must never be able to unlock file writes.
@@ -102,7 +120,7 @@ export function readConfig() {
     claudeBin: process.env.RIFFIN_BRIDGE_CLAUDE_BIN || "claude",
     codexBin: process.env.RIFFIN_BRIDGE_CODEX_BIN || "codex",
     // Custom CLI agent (RIFFIN_BRIDGE_AGENT=custom): any coding-agent CLI (aider, opencode, a
-    // future GLM-based tool). BIN is the binary; ARGS is a whitespace-split template where a
+    // future model-specific tool). BIN is the binary; ARGS is a whitespace-split template where a
     // literal {prompt} token becomes ONE argv element (never a shell string). No {prompt} → the
     // prompt is appended as the final argument.
     customAgentBin: process.env.RIFFIN_BRIDGE_AGENT_BIN || "",
@@ -121,4 +139,10 @@ export function readConfig() {
     // Reported mode for /health: "llm" when proxying an HTTP LLM, else "cli" (agent).
     mode: llmUrl ? "llm" : "cli",
   };
+  cfg.codexPolicy = null;
+  if (cfg.mode === "cli" && cfg.agent === "codex") {
+    if (codexPolicyMode === "enforce") cfg.codexPolicy = enforceCodexPolicy(cfg);
+    else if (codexPolicyMode === "inspect") cfg.codexPolicy = inspectCodexPolicy(cfg);
+  }
+  return cfg;
 }

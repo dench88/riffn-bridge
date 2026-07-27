@@ -14,7 +14,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { snapshotRepo } from "../src/git.js";
-import { buildJobArgs, EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS, createJobStore, SnapshotError } from "../src/jobs.js";
+import {
+  buildJobArgs, EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS, READ_JOB_ALLOWED_TOOLS,
+  createJobStore, SnapshotError,
+} from "../src/jobs.js";
 import { isEditToolAllowed, isEditPathAllowed } from "../src/edit-policy.js";
 import { agentCaps, agentCommand, childEnv, effectiveCaps } from "../src/agent.js";
 import { resolveEditMode } from "../src/config.js";
@@ -50,9 +53,16 @@ function makeCfg(overrides = {}) {
     cwd: dir, envDir: dir,
     timeoutMs: 5000, jobTimeoutMs: 5000,
     ttsConfigured: false, modelId: "riffn-bridge", allowEditJobs: false,
+    codexProbeMode: true,
     ...overrides,
   };
 }
+
+const TOOL_CONFIGS = {
+  mcpConfigPath: "/tmp/empty-mcp.json",
+  readSettingsPath: "/tmp/read-settings.json",
+  editSettingsPath: "/tmp/edit-settings.json",
+};
 
 test("snapshotRepo captures modified + untracked files without touching the tree", () => {
   const repo = makeRepo();
@@ -84,13 +94,17 @@ test("snapshotRepo throws outside a git work tree", () => {
   }
 });
 
-test("buildJobArgs: edit caps add the four containment controls; read caps add none", () => {
-  const read = buildJobArgs("do it", "sys", undefined, "sess1");
-  const edit = buildJobArgs("do it", "sys", "edit", "sess1",
-    { mcpConfigPath: "/tmp/empty-mcp.json", settingsPath: "/tmp/edit-settings.json" });
+test("buildJobArgs pins mode-specific containment on read and edit jobs", () => {
+  const read = buildJobArgs("do it", "sys", undefined, "sess1", TOOL_CONFIGS);
+  const edit = buildJobArgs("do it", "sys", "edit", "sess1", TOOL_CONFIGS);
 
   assert.deepEqual(read, [
     "-p", "do it", "--output-format", "stream-json", "--verbose",
+    "--settings", "/tmp/read-settings.json",
+    "--permission-mode", "dontAsk",
+    "--strict-mcp-config", "--mcp-config", "/tmp/empty-mcp.json",
+    "--allowedTools", ...READ_JOB_ALLOWED_TOOLS,
+    "--disallowedTools", ...EDIT_JOB_DISALLOWED_TOOLS,
     "--resume", "sess1", "--append-system-prompt", "sys",
   ]);
   assert.deepEqual(edit, [
@@ -102,7 +116,8 @@ test("buildJobArgs: edit caps add the four containment controls; read caps add n
     "--disallowedTools", ...EDIT_JOB_DISALLOWED_TOOLS,
     "--resume", "sess1", "--append-system-prompt", "sys",
   ]);
-  // The PreToolUse hook (--settings) is the guarantee; dontAsk makes the allowlist exclusive.
+  // The PreToolUse hook (--settings) is the guarantee on both tiers.
+  assert.ok(read.includes("--settings"));
   assert.ok(edit.includes("--settings"));
   assert.equal(edit[edit.indexOf("--permission-mode") + 1], "dontAsk");
   // No execution/delegation tool may appear on the allowlist; all stay on the backstop denylist.
@@ -112,12 +127,32 @@ test("buildJobArgs: edit caps add the four containment controls; read caps add n
   }
 });
 
+test("agentCommand refuses uncontained Claude and pins read/write tool profiles", () => {
+  const readCfg = makeCfg({ editMode: "disabled" });
+  assert.throws(() => agentCommand(readCfg, "hello"), /containment was not prepared/);
+
+  const read = agentCommand(readCfg, "hello", null, "", TOOL_CONFIGS).args;
+  assert.equal(read[read.indexOf("--settings") + 1], TOOL_CONFIGS.readSettingsPath);
+  assert.ok(read.includes("--strict-mcp-config"));
+  for (const tool of READ_JOB_ALLOWED_TOOLS) assert.ok(read.includes(tool));
+  assert.ok(!read.includes("Edit"));
+  assert.ok(read.includes("Bash"), "known shell tools must appear in the disallowed list");
+
+  const write = agentCommand(
+    makeCfg({ editMode: "ungated" }), "hello", null, "", TOOL_CONFIGS
+  ).args;
+  assert.equal(write[write.indexOf("--settings") + 1], TOOL_CONFIGS.editSettingsPath);
+  assert.ok(write.includes("Edit"));
+});
+
 // The hook is the guarantee — test it end to end by piping tool requests through the real script,
 // exactly as Claude Code invokes it. Denied tools must produce permissionDecision "deny".
 test("edit-guard-hook denies non-allowlisted tools and allows repo tools (fail-closed)", () => {
   const hookPath = fileURLToPath(new URL("../src/edit-guard-hook.js", import.meta.url));
-  const runHook = (stdin) =>
-    spawnSyncNode(process.execPath, [hookPath], { input: stdin, encoding: "utf8" });
+  const runHook = (stdin, mode = "edit") =>
+    spawnSyncNode(process.execPath, [hookPath, ...(mode === "read" ? ["read"] : [])], {
+      input: stdin, encoding: "utf8",
+    });
 
   const repoCwd = mkdtempSync(path.join(os.tmpdir(), "riffn-test-hookcwd-"));
   const decisionFor = (toolName, toolInput = {}) => {
@@ -128,10 +163,16 @@ test("edit-guard-hook denies non-allowlisted tools and allows repo tools (fail-c
     return JSON.parse(r.stdout).hookSpecificOutput.permissionDecision;
   };
   try {
-    // Allowlisted read/web tools → allow (no path boundary on reads).
-    for (const t of ["Read", "Glob", "Grep", "WebFetch"]) {
-      assert.equal(decisionFor(t), "allow", `${t} should be allowed`);
-    }
+    // Read/navigation tools stay inside the repo; omitted search roots mean cwd.
+    assert.equal(decisionFor("Read", { file_path: path.join(repoCwd, "README.md") }), "allow");
+    assert.equal(decisionFor("Read"), "deny", "Read without a path must fail closed");
+    assert.equal(decisionFor("Read", { file_path: path.join(repoCwd, "..", "outside.txt") }), "deny");
+    assert.equal(decisionFor("Read", { file_path: path.join(repoCwd, ".env") }), "deny");
+    assert.equal(decisionFor("Read", { file_path: path.join(repoCwd, "nested", "secret.env") }), "deny");
+    assert.equal(decisionFor("Read", { file_path: path.join(repoCwd, "workers", ".dev.vars") }), "deny");
+    for (const t of ["Glob", "Grep"]) assert.equal(decisionFor(t), "allow");
+    assert.equal(decisionFor("Grep", { path: path.join(repoCwd, "..") }), "deny");
+    assert.equal(decisionFor("WebFetch"), "allow");
     // Allowlisted WRITE tools → allow only with an in-repo target (fail closed without one).
     const inside = path.join(repoCwd, "notes.md");
     assert.equal(decisionFor("Edit", { file_path: inside }), "allow");
@@ -139,6 +180,12 @@ test("edit-guard-hook denies non-allowlisted tools and allows repo tools (fail-c
     assert.equal(decisionFor("Write", {}), "deny", "write tool with no path must fail closed");
     assert.equal(decisionFor("Edit", { file_path: path.join(repoCwd, "..", "escape.md") }), "deny");
     assert.equal(decisionFor("NotebookEdit", { notebook_path: path.join(os.tmpdir(), "outside.ipynb") }), "deny");
+    for (const protectedPath of [
+      ".env", "workers/.dev.vars", ".claude/settings.json", ".vscode/tasks.json",
+      ".codex/config.toml", ".agents/AGENTS.md", ".venv/activate", "node_modules/pkg/index.js",
+    ]) {
+      assert.equal(decisionFor("Write", { file_path: path.join(repoCwd, protectedPath) }), "deny");
+    }
     // Everything else — exec, subagents, the CronList/Monitor class, MCP tools → deny.
     for (const t of ["Bash", "Monitor", "CronList", "Task", "Agent", "mcp__claude_ai_Gmail__send", "RemoteTrigger"]) {
       assert.equal(decisionFor(t), "deny", `${t} MUST be denied`);
@@ -151,14 +198,31 @@ test("edit-guard-hook denies non-allowlisted tools and allows repo tools (fail-c
     assert.ok(isEditToolAllowed("Edit"));
     assert.ok(!isEditToolAllowed("Bash"));
     assert.ok(!isEditToolAllowed("CronList"));
+
+    // The same hook pins ordinary chat/jobs to read-only, independent of global Claude settings.
+    const readRequest = (toolName, toolInput = {}) => JSON.stringify({
+      hook_event_name: "PreToolUse", tool_name: toolName, tool_input: toolInput, cwd: repoCwd,
+    });
+    assert.equal(
+      JSON.parse(runHook(readRequest("Read", { file_path: "README.md" }), "read").stdout)
+        .hookSpecificOutput.permissionDecision,
+      "allow"
+    );
+    for (const toolName of ["Edit", "Write", "Bash", "Task"]) {
+      assert.equal(
+        JSON.parse(runHook(readRequest(toolName, { file_path: "source.js" }), "read").stdout)
+          .hookSpecificOutput.permissionDecision,
+        "deny"
+      );
+    }
   } finally {
     rmSync(repoCwd, { recursive: true, force: true });
   }
 });
 
-// The path boundary itself (pure function): write targets must resolve inside cwd; everything
-// about a write that can't be judged is denied; non-write tools carry no path to judge.
-test("isEditPathAllowed: write tools are confined to the working directory, fail-closed", () => {
+// The path boundary itself (pure function): all file tools stay in cwd, secrets are unreadable,
+// and automation inputs are write-protected.
+test("isEditPathAllowed confines file tools and protects secrets and automation paths", () => {
   const root = path.join(os.tmpdir(), "riffn-boundary-root");
 
   // Inside: absolute, relative, nested, and a dot-prefixed FILE name that merely looks like "..".
@@ -186,14 +250,46 @@ test("isEditPathAllowed: write tools are confined to the working directory, fail
   assert.ok(!isEditPathAllowed("Edit", { file_path: "" }, root));
   assert.ok(!isEditPathAllowed("Write", { file_path: "a.txt" }, ""));
 
-  // Non-write tools have no path boundary (reads/search/web stay unrestricted).
-  assert.ok(isEditPathAllowed("Read", { file_path: path.join(os.tmpdir(), "anywhere.txt") }, root));
+  // Reads stay in cwd and cannot target environment/worker secret files.
+  assert.ok(isEditPathAllowed("Read", { file_path: "README.md" }, root));
+  assert.ok(!isEditPathAllowed("Read", {}, root));
+  assert.ok(!isEditPathAllowed("Read", { file_path: path.join(os.tmpdir(), "anywhere.txt") }, root));
+  assert.ok(!isEditPathAllowed("Read", { file_path: ".env" }, root));
+  assert.ok(!isEditPathAllowed("Read", { file_path: "nested/secret.env" }, root));
+  assert.ok(!isEditPathAllowed("Read", { file_path: "workers/.dev.vars.local" }, root));
   assert.ok(isEditPathAllowed("Grep", {}, root));
+  assert.ok(!isEditPathAllowed("Grep", { path: ".." }, root));
+
+  // Host-consumed automation and dependency subtrees are read-only.
+  for (const protectedPath of [
+    ".venv/x", ".vscode/x", ".claude/x", ".codex/x", ".agents/x",
+    "node_modules/x", "workers/node_modules/x",
+  ]) {
+    assert.ok(!isEditPathAllowed("Write", { file_path: protectedPath }, root));
+    assert.ok(isEditPathAllowed("Read", { file_path: protectedPath }, root));
+  }
+
+  // A bridge run from source inside the workspace cannot edit its own live guard/package.
+  const bridgeRoot = path.join(root, "tools", "riffin-bridge");
+  assert.ok(!isEditPathAllowed(
+    "Write",
+    { file_path: path.join(bridgeRoot, "src", "edit-policy.js") },
+    root,
+    { protectedRoots: [bridgeRoot] }
+  ));
+  assert.ok(isEditPathAllowed(
+    "Read",
+    { file_path: path.join(bridgeRoot, "src", "edit-policy.js") },
+    root,
+    { protectedRoots: [bridgeRoot] }
+  ));
+
+  // Web tools have no filesystem target.
   assert.ok(isEditPathAllowed("WebFetch", { url: "https://example.com" }, root));
 });
 
 test("edit-job dispatch writes the MCP config and the guard-hook settings before spawning", async () => {
-  // Exercise the store's start() far enough to trigger ensureEditConfigs, in a real repo so the
+  // Exercise the store's start() far enough to generate the tool configs, in a real repo so the
   // snapshot succeeds and the (non-existent) claudeBin only fails AFTER the files are written.
   const repo = makeRepo();
   const cfg = makeCfg({ cwd: repo, allowEditJobs: true });
@@ -216,6 +312,15 @@ test("edit-job dispatch writes the MCP config and the guard-hook settings before
     // The referenced hook script must actually exist on disk (a dangling path = fail-open).
     const hookFile = hookCmd.match(/"([^"]+)"/)[1];
     assert.ok(existsSync(hookFile), "guard hook script referenced by settings must exist");
+
+    const readSettingsPath = path.join(os.tmpdir(), `riffn-bridge-read-settings-${process.pid}.json`);
+    assert.ok(existsSync(readSettingsPath), "read settings must be written before any Claude turn");
+    const readSettings = JSON.parse(readFileSync(readSettingsPath, "utf8"));
+    assert.match(
+      readSettings.hooks.PreToolUse[0].hooks[0].command,
+      /edit-guard-hook\.js" read$/,
+      "ordinary read turns must invoke the guard in read-only mode"
+    );
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(cfg.envDir, { recursive: true, force: true });
@@ -237,27 +342,28 @@ test("jobs.start with edit caps refuses (SnapshotError) outside a repo, leaving 
 test("agentCaps reports edit-jobs arming honestly (claude-only)", () => {
   assert.equal(agentCaps(makeCfg()), "read-plan");
   assert.equal(agentCaps(makeCfg({ allowEditJobs: true })), "read-plan+edit-jobs");
-  assert.equal(agentCaps(makeCfg({ agent: "codex", allowEditJobs: true })), "read-plan");
+  assert.equal(agentCaps(makeCfg({ agent: "codex", allowEditJobs: true })), "disabled-by-policy");
   assert.equal(agentCaps(makeCfg({ agent: "custom", allowEditJobs: true })), "operator-defined");
 });
 
 // edit_mode_plan.md step 1 (hardened per the 2026-07-16 review): the codex chat path must pin the
 // ENTIRE posture every turn — sandbox, isolated config, approval policy, shell env policy — since
 // a bare `codex exec` inherits the operator's own ~/.codex/config.toml (how the dogfood edited
-// files while /health said read-plan). read-only unless always-edit was chosen; caps must say so.
-const CODEX_HARDENING = ["--ignore-user-config", "-c", "approval_policy=never", "-c", "shell_environment_policy.inherit=core"];
-test("codex posture is pinned per edit mode, and caps report ungated honestly", () => {
+// files while /health said read-plan). The dormant argv stays pinned for future probing, while the
+// active product capability must report the direct-Codex kill switch for every edit mode.
+test("dormant codex posture is pinned per edit mode, while active caps stay disabled", () => {
   const readOnly = agentCommand(makeCfg({ agent: "codex", codexBin: "codex" }), "hi");
-  assert.deepEqual(readOnly.args, ["exec", "--sandbox", "read-only", ...CODEX_HARDENING, "hi"]);
+  assert.equal(readOnly.args.includes("--sandbox"), false);
+  assert.ok(readOnly.args.includes('default_permissions="riffn_bridge_read_v1"'));
 
   const limited = agentCommand(makeCfg({ agent: "codex", codexBin: "codex", editMode: "limited" }), "hi");
-  assert.deepEqual(limited.args, ["exec", "--sandbox", "read-only", ...CODEX_HARDENING, "hi"], "limited chat stays read-only");
+  assert.ok(limited.args.includes('default_permissions="riffn_bridge_read_v1"'), "limited chat stays read-only");
 
   const ungated = agentCommand(makeCfg({ agent: "codex", codexBin: "codex", editMode: "ungated" }), "hi");
-  assert.deepEqual(ungated.args, ["exec", "--sandbox", "workspace-write", ...CODEX_HARDENING, "hi"]);
+  assert.ok(ungated.args.includes('default_permissions="riffn_bridge_write_v1"'));
 
-  assert.equal(agentCaps(makeCfg({ agent: "codex", editMode: "ungated", allowEditJobs: true })), "ungated");
-  assert.equal(agentCaps(makeCfg({ agent: "codex", editMode: "limited", allowEditJobs: true })), "read-plan");
+  assert.equal(agentCaps(makeCfg({ agent: "codex", editMode: "ungated", allowEditJobs: true })), "disabled-by-policy");
+  assert.equal(agentCaps(makeCfg({ agent: "codex", editMode: "limited", allowEditJobs: true })), "disabled-by-policy");
   assert.equal(agentCaps(makeCfg({ editMode: "ungated", allowEditJobs: true })), "ungated", "claude ungated caps");
 });
 
@@ -290,19 +396,22 @@ test("effectiveCaps: the (mode × request × agent) permission matrix", () => {
   assert.equal(effectiveCaps(makeCfg({ allowEditJobs: true }), undefined), "read", "limited never writes without an explicit request");
   assert.equal(effectiveCaps(makeCfg({ editMode: "ungated", allowEditJobs: true }), undefined), "ungated");
   assert.equal(effectiveCaps(makeCfg({ editMode: "ungated", allowEditJobs: true }), "edit"), "ungated", "an explicit request under ungated stays on ungated semantics");
-  assert.equal(effectiveCaps(makeCfg({ agent: "codex", editMode: "ungated", allowEditJobs: true }), undefined), "read", "codex writes are the sandbox flag's job, never a claude-shaped caps tier");
+  assert.equal(
+    effectiveCaps(makeCfg({ agent: "codex", editMode: "ungated", allowEditJobs: true }), undefined),
+    "read",
+    "direct Codex never derives a Claude write tier; the product policy refuses it separately"
+  );
 });
 
 // Ungated jobs get the IDENTICAL containment argv as edit jobs — the tiers differ in session and
 // snapshot semantics only — and, unlike edit jobs, they may carry --resume (the mode-stamped
 // session store guarantees any resumed session was created under ungated, i.e. born locked-down).
 test("buildJobArgs: ungated = edit containment + resumable session", () => {
-  const edit = { mcpConfigPath: "/tmp/m.json", settingsPath: "/tmp/s.json" };
-  const editArgs = buildJobArgs("p", "", "edit", null, edit);
-  const ungatedArgs = buildJobArgs("p", "", "ungated", null, edit);
+  const editArgs = buildJobArgs("p", "", "edit", null, TOOL_CONFIGS);
+  const ungatedArgs = buildJobArgs("p", "", "ungated", null, TOOL_CONFIGS);
   assert.deepEqual(ungatedArgs, editArgs, "same containment flags, nothing more, nothing less");
 
-  const resumed = buildJobArgs("p", "", "ungated", "sess-1", edit);
+  const resumed = buildJobArgs("p", "", "ungated", "sess-1", TOOL_CONFIGS);
   assert.ok(resumed.includes("--resume"), "ungated jobs resume the mode-stamped session");
   assert.ok(resumed.includes("--settings"), "containment still present on resume");
 });
@@ -402,17 +511,17 @@ test("readConfig degrades a stamped edit mode to disabled on agent mismatch", as
   };
   for (const [k, v] of Object.entries(vars)) { saved[k] = process.env[k]; process.env[k] = v; }
   try {
-    let cfg = readConfig();
+    let cfg = readConfig({ codexPolicyMode: "skip" });
     assert.equal(cfg.editMode, "disabled", "mismatched stamp degrades to disabled");
     assert.equal(cfg.editModeAgentMismatch, true);
 
     process.env.RIFFIN_BRIDGE_EDIT_MODE_AGENT = "codex"; // stamp matches → mode honored
-    cfg = readConfig();
+    cfg = readConfig({ codexPolicyMode: "skip" });
     assert.equal(cfg.editMode, "ungated");
     assert.equal(cfg.editModeAgentMismatch, false);
 
     delete process.env.RIFFIN_BRIDGE_EDIT_MODE_AGENT;    // no stamp (hand-written .env) → honored
-    cfg = readConfig();
+    cfg = readConfig({ codexPolicyMode: "skip" });
     assert.equal(cfg.editMode, "ungated");
   } finally {
     for (const [k, v] of Object.entries(saved)) {
@@ -425,7 +534,7 @@ test("readConfig degrades a stamped edit mode to disabled on agent mismatch", as
 
 // Spin the real server on an ephemeral port and drive the two-key gate over HTTP.
 async function withServer(cfg, fn) {
-  const server = startServer(cfg);
+  const server = startServer(cfg, { quiet: true });
   await new Promise((resolve) => server.on("listening", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try { await fn(base); } finally { server.close(); }
@@ -478,12 +587,11 @@ test("edit jobs never resume the chat session (fresh session; no --resume)", () 
   try {
     // Read job: buildJobArgs (via the same code path) would include --resume; assert the store
     // passes the existing session through for read but not for edit by checking buildJobArgs.
-    const readArgs = buildJobArgs("p", "", undefined, sessionStub.get());
+    const readArgs = buildJobArgs("p", "", undefined, sessionStub.get(), TOOL_CONFIGS);
     assert.ok(readArgs.includes("--resume"), "read jobs still resume the chat session");
 
     // Edit path passes sessionId=null (fresh) — assert buildJobArgs omits --resume when null.
-    const editArgs = buildJobArgs("p", "", "edit", null,
-      { mcpConfigPath: "/tmp/m.json", settingsPath: "/tmp/s.json" });
+    const editArgs = buildJobArgs("p", "", "edit", null, TOOL_CONFIGS);
     assert.ok(!editArgs.includes("--resume"), "edit jobs must NOT resume any session");
   } finally {
     rmSync(repo, { recursive: true, force: true });

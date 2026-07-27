@@ -3,10 +3,14 @@
 
 import http from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { MAX_BODY_BYTES, VERSION, redactedCwd } from "./config.js";
+import { MAX_BODY_BYTES, VERSION, codexPolicyHealth, redactedCwd } from "./config.js";
 import { log, errorType, warnVerboseIfEnabled } from "./log.js";
-import { generateText, agentCaps, agentCapabilities, customAgentCapsWarning, effectiveCaps, extractSystemPrompt } from "./agent.js";
-import { snapshotRepoRing, SNAPSHOT_RING_SIZE } from "./git.js";
+import {
+  generateText, agentCaps, agentCapabilities, customAgentCapsWarning, effectiveCaps,
+  extractSystemPrompt, agentCommand, buildPrompt,
+} from "./agent.js";
+import { changedFilesSinceSnapshot, snapshotRepoRing, SNAPSHOT_RING_SIZE } from "./git.js";
+import { beginCodexTurn, finishCodexTurn } from "./audit.js";
 import { synthesize, mimeForFormat } from "./tts.js";
 import { createSessionStore, peekRaw as peekRawSession } from "./session.js";
 import { createJobStore, SnapshotError } from "./jobs.js";
@@ -83,7 +87,7 @@ function completion(text, model, audio) {
   };
 }
 
-export function startServer(cfg) {
+export function startServer(cfg, { quiet = false } = {}) {
   if (!cfg.token) {
     console.error("✖ No RIFFIN_BRIDGE_TOKEN set. Run `riffn-bridge init` to generate one and pair.");
     process.exit(1);
@@ -123,7 +127,7 @@ export function startServer(cfg) {
     ? createJobStore(cfg, session)
     : null;
 
-  // DIAGNOSTIC: if a session file already exists in this launch folder for a DIFFERENT cwd, that's
+  // DIAGNOSTIC: if a session file already exists in this state directory for a DIFFERENT cwd, that's
   // the signature of two bridge instances sharing an envDir and colliding over one session file —
   // print it loudly rather than silently self-correcting, so a mixed-up multi-agent setup gets
   // caught at startup instead of surfacing later as a confusing cross-topic reply.
@@ -131,12 +135,12 @@ export function startServer(cfg) {
     const raw = peekRawSession(cfg.envDir);
     if (raw && raw.cwd !== cfg.cwd) {
       console.warn(
-        `⚠️  Found a saved session for a DIFFERENT working directory in this launch folder:\n` +
-        `      this launch folder (envDir): ${cfg.envDir}\n` +
+        `⚠️  Found a saved session for a DIFFERENT working directory in this state directory:\n` +
+        `      state directory (envDir):    ${cfg.envDir}\n` +
         `      saved session's cwd:         ${raw.cwd}\n` +
         `      this bridge's cwd:           ${cfg.cwd}\n` +
         `    This is safe (a fresh session starts for THIS cwd), but if you run more than one\n` +
-        `    riffn-bridge, launch each from ITS OWN folder — sharing a launch folder means they\n` +
+        `    riffn-bridge, give each its own state directory — sharing state means they\n` +
         `    fight over the same session file. See dev_resources/bridge_plan.md diagnostics.`
       );
     }
@@ -183,6 +187,7 @@ export function startServer(cfg) {
         // Structured per-axis capabilities (edit_mode_plan.md): editMode / chatWrites / editJobs /
         // shell / snapshotPolicy. The app prefers this and falls back to `caps` when absent.
         capabilities: agentCapabilities(cfg) ?? undefined,
+        codexPolicy: codexPolicyHealth(cfg),
         sessionActive: Boolean(session?.get()),            // persistent thread already established?
         jobs: Boolean(jobs),                               // does this bridge support §13 jobs?
         notes: true,                                       // POST /v1/notes (helper-written riffn-notes/)
@@ -215,24 +220,56 @@ export function startServer(cfg) {
         const ac = new AbortController();
         res.on("close", () => { if (!res.writableFinished) ac.abort(); });
 
-        // Ungated Claude (edit_mode_plan.md): the chat path is only the fallback for non-jobs
-        // clients, but permissions must derive identically on both paths (review finding #3) —
-        // a turn arriving here is as write-capable as the same turn dispatched as a job. Same
-        // fail-closed pair as jobs.start: containment files + ring snapshot, or the turn refuses.
-        let editChat = null;
-        if (effectiveCaps(cfg, undefined) === "ungated" && jobs) {
+        // Every Claude turn gets generated hook/MCP containment; an ungated turn additionally
+        // requires its pre-turn ring snapshot. If either preparation fails, refuse the turn.
+        let claudeSecurity = null;
+        let codexSnapshot = null;
+        let codexAudit = null;
+        if (cfg.mode === "cli" && cfg.agent === "claude" && jobs) {
           try {
-            editChat = jobs.editConfigs();
-            snapshotRepoRing(cfg.cwd);
+            claudeSecurity = jobs.securityConfigs();
+            if (effectiveCaps(cfg, undefined) === "ungated") snapshotRepoRing(cfg.cwd);
           } catch (err) {
-            log.error("ungated_chat_refused", err);
-            return sendError(res, 503, "Couldn't snapshot the repo before this turn, so it wasn't run. Check git on that machine.");
+            log.error("claude_turn_refused", err);
+            return sendError(res, 503, "Couldn't lock down the agent (or snapshot an ungated turn), so it wasn't run.");
+          }
+        }
+        if (cfg.mode === "cli" && cfg.agent === "codex") {
+          try {
+            codexAudit = beginCodexTurn(cfg, agentCommand(cfg, buildPrompt(messages)));
+            if (cfg.editMode === "ungated") codexSnapshot = snapshotRepoRing(cfg.cwd);
+          } catch (err) {
+            log.error("codex_turn_refused", err);
+            if (codexAudit) {
+              try {
+                finishCodexTurn(cfg, codexAudit, {
+                  outcome: "refused",
+                  error: errorType(err),
+                });
+              } catch (auditErr) {
+                log.error("codex_audit_failed", auditErr);
+              }
+            }
+            return sendError(res, 503, "Couldn't create the Codex audit/snapshot record, so the turn wasn't run.");
           }
         }
 
         inFlight = true;
         try {
-          const text = await generateText(cfg, messages, body?.model, ac.signal, session, editChat);
+          const text = await generateText(
+            cfg, messages, body?.model, ac.signal, session, claudeSecurity
+          );
+          if (codexAudit) {
+            const filesChanged = codexSnapshot
+              ? changedFilesSinceSnapshot(cfg.cwd, codexSnapshot.commit)
+              : [];
+            finishCodexTurn(cfg, codexAudit, {
+              outcome: "succeeded",
+              snapshotRef: codexSnapshot?.ref || null,
+              filesChanged,
+            });
+            codexAudit = null;
+          }
           if (res.writableEnded) return;
           // The app always requests stream:true → emit SSE so its existing streaming path consumes
           // the reply unchanged. Plain (non-stream) callers get a normal JSON completion.
@@ -254,6 +291,22 @@ export function startServer(cfg) {
           }
           send(res, 200, completion(text, body?.model || cfg.modelId, audio));
         } catch (err) {
+          if (codexAudit) {
+            try {
+              const filesChanged = codexSnapshot
+                ? changedFilesSinceSnapshot(cfg.cwd, codexSnapshot.commit)
+                : [];
+              finishCodexTurn(cfg, codexAudit, {
+                outcome: "failed",
+                snapshotRef: codexSnapshot?.ref || null,
+                filesChanged,
+                error: errorType(err),
+              });
+            } catch (auditErr) {
+              log.error("codex_audit_failed", auditErr);
+            }
+            codexAudit = null;
+          }
           log.error("agent_error", err);
           if (!res.writableEnded) sendError(res, 502, `Agent error (${errorType(err)}).`);
         } finally {
@@ -380,7 +433,7 @@ export function startServer(cfg) {
   server.on("error", (err) => {
     if (err.code === "EADDRINUSE") {
       console.error(`✖ Port ${cfg.port} on ${cfg.host} is already in use — likely another riffn-bridge.`);
-      console.error(`  Each bridge needs its own port (and its own launch folder). Either stop the other`);
+      console.error(`  Each bridge needs its own port. Either stop the other`);
       console.error(`  process, or give this one a different port:`);
       console.error(`    RIFFIN_BRIDGE_PORT=${cfg.port + 1} riffn-bridge start   (or set it in .env / re-run init)`);
       process.exit(1);
@@ -389,6 +442,7 @@ export function startServer(cfg) {
   });
 
   server.listen(cfg.port, cfg.host, () => {
+    if (quiet) return;
     warnVerboseIfEnabled();
     const caps = agentCaps(cfg);
     const capsLabel = caps === "read-plan" ? "read/plan-only"
@@ -411,9 +465,8 @@ export function startServer(cfg) {
     }
     if (caps === "ungated") {
       const perAgent = cfg.agent === "codex"
-        ? `    On Codex this tier is SANDBOXED SHELL + WORKSPACE EDITS: model-run commands execute,\n` +
-          `    contained to that directory (accept-and-label — edit_mode_plan.md). No automatic\n` +
-          `    snapshots are taken — rely on your own git discipline.\n`
+        ? `    On Codex this tier is a PINNED WRITE PROFILE + COMMAND SHELL. Secret and automation\n` +
+          `    paths stay protected; every turn is snapshotted and audited outside the workspace.\n`
         : `    On Claude, edits are contained (no commands, no git, no MCP) and every write-capable\n` +
           `    turn snapshots the repo first (refs/riffn/ring-*, last ${SNAPSHOT_RING_SIZE} kept).\n`;
       console.warn(
@@ -441,7 +494,7 @@ export function startServer(cfg) {
     // actually running in / launched from" is exactly the question that's hard to answer once you
     // have more than one bridge running — see bridge_plan.md diagnostics.
     console.log(`  agent cwd: ${cfg.cwd}`);
-    console.log(`  launch dir (session state lives here): ${cfg.envDir}`);
+    console.log(`  state dir: ${cfg.envDir}`);
     console.log(`  tts:  ${cfg.ttsConfigured ? "configured" : "not configured — text only"}`);
     console.log(`  Model URL for Riffn:  http://${cfg.host}:${cfg.port}/v1`);
   });

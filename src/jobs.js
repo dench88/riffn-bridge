@@ -17,7 +17,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { log } from "./log.js";
 import { snapshotRepo, snapshotRepoRing } from "./git.js";
-import { EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS } from "./edit-policy.js";
+import {
+  EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS, READ_JOB_ALLOWED_TOOLS,
+} from "./edit-policy.js";
 import { childEnv } from "./agent.js";
 import { resolveSpawnTarget } from "./win-shim.js";
 
@@ -28,7 +30,7 @@ const EDIT_GUARD_HOOK = fileURLToPath(new URL("./edit-guard-hook.js", import.met
 // The edit-job tool policy (EDIT_JOB_ALLOWED_TOOLS / EDIT_JOB_DISALLOWED_TOOLS) lives in
 // edit-policy.js so the PreToolUse hook shares it. Re-exported here for the existing tests +
 // callers that import from jobs.js.
-export { EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS };
+export { EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS, READ_JOB_ALLOWED_TOOLS };
 
 // Containing an EDIT job's tool surface (execute_jobs_plan.md invariant 4) is DEFENCE IN DEPTH —
 // the first dogfood (2026-07-12) proved no single CLI flag suffices (--allowedTools isn't
@@ -38,19 +40,27 @@ export { EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS };
 //  1. PreToolUse HOOK (edit-guard-hook.js, matcher "*") — THE GUARANTEE. Per the Claude Code docs
 //     a hook "runs before every other step" and its deny "applies even in bypassPermissions mode",
 //     so it vetoes EVERY non-allowlisted tool regardless of how the CLI classifies it. Loaded via
-//     --settings (see writeEditSettings). Fails closed (unreadable request → deny).
+//     --settings (see guardHookSettings). Fails closed (unreadable request → deny).
 //  2. `--permission-mode dontAsk` + `--allowedTools` — the documented "locked-down agent" recipe:
 //     anything not on the allowlist is denied outright (canUseTool never called). Fails closed.
 //  3. `--strict-mcp-config` + empty config → zero MCP servers loaded (the external-side-effect
 //     class: Gmail/Drive/Calendar/RemoteTrigger). Confirmed working in the dogfood.
 //  4. `--disallowedTools` for named built-in exec/delegation tools — deny applies even in bypass.
 //
-// A build-hook JSON registering the guard for PreToolUse, matcher "*" (every tool).
-function editHookSettings() {
+// A settings JSON registering the guard for PreToolUse, matcher "*" (every tool). Read turns use
+// the same guard in read-only mode, so operator/global Claude permissions cannot re-enable shell,
+// MCP, writes, outside-workspace reads, or secret reads.
+function guardHookSettings(mode) {
   return {
     hooks: {
       PreToolUse: [
-        { matcher: "*", hooks: [{ type: "command", command: `node "${EDIT_GUARD_HOOK}"` }] },
+        {
+          matcher: "*",
+          hooks: [{
+            type: "command",
+            command: `node "${EDIT_GUARD_HOOK}"${mode === "read" ? " read" : ""}`,
+          }],
+        },
       ],
     },
   };
@@ -63,21 +73,22 @@ export class SnapshotError extends Error {
 }
 
 // The exact argv a job spawns `claude` with — exported (and kept pure) so tests can pin the
-// edit-caps flags without spawning anything. For write-capable jobs ("edit" and "ungated"), `edit`
-// carries the two written file paths the flags reference: { mcpConfigPath, settingsPath }.
+// containment flags without spawning anything. `security` carries the generated empty MCP config
+// and mode-specific hook settings paths.
 // "ungated" (edit_mode_plan.md) gets the identical containment set as "edit" — the tiers differ
 // in ceremony (gate, session, snapshot cadence), never in what the agent is allowed to touch.
-export function buildJobArgs(prompt, appendSystemPrompt, caps, sessionId, edit) {
+export function buildJobArgs(prompt, appendSystemPrompt, caps, sessionId, security) {
   const args = ["-p", prompt, "--output-format", "stream-json", "--verbose"];
-  if (caps === "edit" || caps === "ungated") {
-    // The four defence-in-depth controls (see editHookSettings comment). The --settings hook is
-    // the guarantee; dontAsk+allow, strict-mcp, and deny are fail-closed backup.
-    args.push("--settings", edit.settingsPath);
-    args.push("--permission-mode", "dontAsk");
-    args.push("--strict-mcp-config", "--mcp-config", edit.mcpConfigPath);
-    args.push("--allowedTools", ...EDIT_JOB_ALLOWED_TOOLS);
-    args.push("--disallowedTools", ...EDIT_JOB_DISALLOWED_TOOLS);
-  }
+  if (!security) throw new SnapshotError("Claude tool containment was not prepared");
+  const writeCapable = caps === "edit" || caps === "ungated";
+  const settingsPath = writeCapable ? security.editSettingsPath : security.readSettingsPath;
+  const allowedTools = writeCapable ? EDIT_JOB_ALLOWED_TOOLS : READ_JOB_ALLOWED_TOOLS;
+  // The hook is the guarantee; dontAsk+allow, strict-mcp, and deny are fail-closed backup.
+  args.push("--settings", settingsPath);
+  args.push("--permission-mode", "dontAsk");
+  args.push("--strict-mcp-config", "--mcp-config", security.mcpConfigPath);
+  args.push("--allowedTools", ...allowedTools);
+  args.push("--disallowedTools", ...EDIT_JOB_DISALLOWED_TOOLS);
   if (sessionId) args.push("--resume", sessionId);
   if (appendSystemPrompt) args.push("--append-system-prompt", appendSystemPrompt);
   return args;
@@ -108,25 +119,27 @@ export function createJobStore(cfg, session) {
   const file = path.join(cfg.envDir, JOB_FILE);
   const historyFile = path.join(cfg.envDir, HISTORY_FILE);
 
-  // The two config files edit jobs reference: an empty MCP config (--strict-mcp-config) and a
-  // settings file carrying the PreToolUse guard hook (--settings). Written to the OS tmpdir (NOT
+  // The three config files Claude turns reference: an empty MCP config (--strict-mcp-config) and
+  // read/edit settings files carrying the PreToolUse guard hook (--settings). Written to the OS tmpdir (NOT
   // the repo — they must never litter the user's working tree), keyed by pid so concurrent bridges
   // don't collide. Lazily (re)created so a wiped tmp still works. If EITHER can't be written we
-  // cannot guarantee the tool lockdown, so the edit job is REFUSED (SnapshotError → caller 503s),
+  // cannot guarantee the tool lockdown, so the turn is REFUSED (SnapshotError → caller 503s),
   // never run degraded.
   const emptyMcpConfigPath = path.join(os.tmpdir(), `riffn-bridge-empty-mcp-${process.pid}.json`);
   const editSettingsPath = path.join(os.tmpdir(), `riffn-bridge-edit-settings-${process.pid}.json`);
-  function ensureEditConfigs() {
+  const readSettingsPath = path.join(os.tmpdir(), `riffn-bridge-read-settings-${process.pid}.json`);
+  function ensureToolConfigs() {
     try {
       if (!existsSync(emptyMcpConfigPath)) {
         writeFileSync(emptyMcpConfigPath, JSON.stringify({ mcpServers: {} }));
       }
       // Rewrite the settings every time (cheap) — the hook's absolute path must always be current.
-      writeFileSync(editSettingsPath, JSON.stringify(editHookSettings()));
-      return { mcpConfigPath: emptyMcpConfigPath, settingsPath: editSettingsPath };
+      writeFileSync(editSettingsPath, JSON.stringify(guardHookSettings("edit")));
+      writeFileSync(readSettingsPath, JSON.stringify(guardHookSettings("read")));
+      return { mcpConfigPath: emptyMcpConfigPath, editSettingsPath, readSettingsPath };
     } catch (e) {
-      log.error("edit_config_write_failed", e);
-      throw new SnapshotError("couldn't lock down the agent's tools before an edit task");
+      log.error("tool_config_write_failed", e);
+      throw new SnapshotError("couldn't lock down the agent's tools before a turn");
     }
   }
 
@@ -220,7 +233,8 @@ export function createJobStore(cfg, session) {
     history: () => loadHistory().reverse(),
     // The ungated CHAT path (server.js fallback for non-jobs clients) runs under the same
     // containment files as write-capable jobs; throws SnapshotError if they can't be written.
-    editConfigs: () => ensureEditConfigs(),
+    securityConfigs: () => ensureToolConfigs(),
+    editConfigs: () => ensureToolConfigs(), // compatibility alias for older internal callers
 
     // Start a job. Returns the public view immediately; the run continues in the background.
     // Rejects (returns null) if one is already running — one job per bridge (§11.3 cwd guarantee).
@@ -250,9 +264,8 @@ export function createJobStore(cfg, session) {
       // refused. Cadence per tier: "edit" keeps one ref per task; "ungated" snapshots every turn
       // into the pruned ring (review finding #6 — bounded, still fail-closed on capture).
       let snapshotRef = null;
-      let editConfigs = null;
+      const securityConfigs = ensureToolConfigs(); // every Claude turn is pinned, including read
       if (caps === "edit" || caps === "ungated") {
-        editConfigs = ensureEditConfigs(); // throws SnapshotError → caller refuses
         try {
           snapshotRef = (caps === "ungated"
             ? snapshotRepoRing(cfg.cwd)
@@ -275,7 +288,7 @@ export function createJobStore(cfg, session) {
       };
       persist(job);
 
-      const args = buildJobArgs(prompt, appendSystemPrompt, caps, existingSession, editConfigs);
+      const args = buildJobArgs(prompt, appendSystemPrompt, caps, existingSession, securityConfigs);
 
       log.debug("job_start", `id=${id} cwd=${cfg.cwd} caps=${job.caps} resume=${existingSession || "none"}`);
       // Windows: cfg.claudeBin may be an npm .cmd shim — resolve to a directly-spawnable target

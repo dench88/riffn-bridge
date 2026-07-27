@@ -1,7 +1,7 @@
 {
   "name": "@riffn/bridge",
-  "version": "0.5.1",
-  "description": "Voice-drive your OWN agents/models from Riffn: an OpenAI-compatible shim over a local CLI agent (Claude Code / Codex) reached over Tailscale. Read/plan-only; zero runtime dependencies.",
+  "version": "0.6.0",
+  "description": "Voice-drive your own Claude Code or configured custom agent from Riffn over Tailscale. Zero runtime dependencies.",
   "type": "module",
   "bin": {
     "riffn-bridge": "index.js"
@@ -17,11 +17,14 @@
   "scripts": {
     "start": "node index.js start",
     "init": "node index.js init",
-    "test": "node --test"
+    "test": "node --test",
+    "test:codex-security": "node --test test/agent-command.test.js",
+    "probe:codex-security": "node scripts/probe-codex-security.js"
   },
   "files": [
     "index.js",
     "src/",
+    "scripts/",
     "README.md",
     "SECURITY.md",
     ".env.example"

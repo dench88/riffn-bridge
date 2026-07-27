@@ -14,6 +14,9 @@ import { detect, instructions, magicDNSName } from "./tailscale.js";
 import { printPairing, pairingPayloadTTS, clearPairingFromTerminal } from "./qr.js";
 import { startServer } from "./server.js";
 import { ask, findFreePort } from "./init.js";
+import {
+  assertNoLegacyEnv, assertStateOutsideWorkspace, ensureStateDir, resolveStateDir,
+} from "./state.js";
 
 // POSTs a short synth request at the given endpoint/model/voice/key and returns true only on a
 // real audio response — catches a wrong URL, wrong model name, or unreachable server BEFORE a
@@ -38,7 +41,13 @@ async function verifyTTSEndpoint(url, model, voice, key) {
 
 export async function runInitTTS(argv) {
   const yes = argv.includes("--yes") || argv.includes("-y");
-  const envPath = path.join(process.cwd(), ".env");
+  const cwd = path.resolve(process.env.RIFFIN_BRIDGE_CWD || process.cwd());
+  const stateDir = resolveStateDir(cwd);
+  assertStateOutsideWorkspace(stateDir, cwd);
+  assertNoLegacyEnv(process.cwd(), stateDir);
+  ensureStateDir(stateDir);
+  process.env.RIFFIN_BRIDGE_STATE_DIR = stateDir;
+  const envPath = path.join(stateDir, ".env");
   loadEnvFile(envPath);
 
   console.log("\nriffn-bridge tts — link this machine's TTS server as a Riffn voice (Tailscale).\n");
@@ -111,7 +120,7 @@ export async function runInitTTS(argv) {
   // stay stable across restarts), print the QR, and run in the foreground.
   loadEnvFile(envPath);
   process.env.RIFFIN_BRIDGE_TOKEN = token;
-  const cfg = readConfig();
+  const cfg = readConfig({ codexPolicyMode: "enforce" });
   cfg.host = cfg.host || ts.ip;
 
   const freePort = await findFreePort(cfg.host, cfg.port);

@@ -44,7 +44,7 @@ function clear(envDir) {
 
 // Diagnostics: read the session file WITHOUT the cwd-match guard, so callers can detect (and warn
 // about) a different agent's session sitting in the same envDir — the signature of two bridge
-// processes sharing a launch folder and colliding over one session file.
+// processes sharing a state directory and colliding over one session file.
 export function peekRaw(envDir) {
   const file = sessionFilePath(envDir);
   if (!existsSync(file)) return null;

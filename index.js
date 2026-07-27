@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // riffn-bridge — voice-drive your OWN agents/models from Riffn, over your own machine.
 //
-// An OpenAI-compatible HTTP shim over a local CLI agent (Claude Code `claude -p`, or Codex), or an
+// An OpenAI-compatible HTTP shim over Claude Code (`claude -p`) or a configured custom agent, or an
 // HTTP LLM proxy. Riffn already speaks OpenAI-compatible HTTP to a pasted Model URL over Tailscale,
 // so pointing Riffn at this helper lets you talk to the agent on your OWN machine — no app changes,
 // no worker changes, no deploy. See dev_resources/bridge_plan.md.
@@ -11,7 +11,7 @@
 //                            print the pairing QR, and run in the foreground. (Phase 1.5 cut.)
 //   riffn-bridge init --llm  Custom Agents wizard: Ollama probe / --llm <url> / --openclaw,
 //                            multi-entry pairing QR, Mode B proxy (or --link-only, no proxy).
-//   riffn-bridge start       Start the bridge using existing .env / environment.
+//   riffn-bridge start       Start using project-keyed state / environment.
 //   riffn-bridge tts         Voice pairing wizard: on the machine running your TTS server,
 //                            asks for its URL, verifies it, prints the pairing QR, and runs
 //                            in the foreground. No prior `init` or hand-edited .env required.
@@ -25,9 +25,30 @@
 
 import path from "node:path";
 import { loadEnvFile, rotateToken } from "./src/env-file.js";
+import {
+  assertNoLegacyEnv, assertStateOutsideWorkspace, resolveStateDir,
+} from "./src/state.js";
 
-const envPath = path.join(process.cwd(), ".env");
 const [cmd, ...rest] = process.argv.slice(2);
+const launchDir = process.cwd();
+
+function requestedCwd(args = rest) {
+  const index = args.indexOf("--cwd");
+  const fromArgs = index >= 0 ? args[index + 1] : "";
+  return path.resolve(fromArgs || process.env.RIFFIN_BRIDGE_CWD || launchDir);
+}
+
+function loadBridgeState(args = rest) {
+  const cwd = requestedCwd(args);
+  if (args.includes("--cwd")) process.env.RIFFIN_BRIDGE_CWD = cwd;
+  const stateDir = resolveStateDir(cwd);
+  assertStateOutsideWorkspace(stateDir, cwd);
+  assertNoLegacyEnv(launchDir, stateDir);
+  process.env.RIFFIN_BRIDGE_STATE_DIR = stateDir;
+  const envPath = path.join(stateDir, ".env");
+  loadEnvFile(envPath);
+  return envPath;
+}
 
 async function main() {
   switch ((cmd || "start").toLowerCase()) {
@@ -37,10 +58,10 @@ async function main() {
       break;
     }
     case "start": {
-      loadEnvFile(envPath);
+      loadBridgeState();
       const { readConfig } = await import("./src/config.js");
       const { startServer } = await import("./src/server.js");
-      startServer(readConfig());
+      startServer(readConfig({ codexPolicyMode: "enforce" }));
       break;
     }
     case "tts": {
@@ -52,7 +73,7 @@ async function main() {
       break;
     }
     case "rotate": {
-      loadEnvFile(envPath);
+      const envPath = loadBridgeState();
       // Deliberately NOT echoed to the terminal (§10.6: the token must never sit in scrollback;
       // that's the exact exposure rotate exists to fix). It's saved to .env; pairing happens via
       // the QR, which encodes it without displaying it.
@@ -63,11 +84,11 @@ async function main() {
       break;
     }
     case "health": {
-      loadEnvFile(envPath);
-      const { readConfig, redactedCwd, VERSION } = await import("./src/config.js");
+      loadBridgeState();
+      const { readConfig, redactedCwd, VERSION, codexPolicyHealth } = await import("./src/config.js");
       const { createSessionStore } = await import("./src/session.js");
       const { agentCaps } = await import("./src/agent.js");
-      const cfg = readConfig();
+      const cfg = readConfig({ codexPolicyMode: "inspect" });
       const session = cfg.mode === "cli" && cfg.agent === "claude"
         ? createSessionStore(cfg.envDir, cfg.cwd, cfg.editMode)
         : null;
@@ -82,15 +103,16 @@ async function main() {
         tokenSet: Boolean(cfg.token),
         // Same honesty rule as the HTTP /health: custom agents are operator-defined, not read-plan.
         caps: agentCaps(cfg),
+        codexPolicy: codexPolicyHealth(cfg),
         sessionActive: Boolean(session?.get()),
       }, null, 2));
       break;
     }
     case "reset-session": {
-      loadEnvFile(envPath);
+      loadBridgeState();
       const { readConfig } = await import("./src/config.js");
       const { createSessionStore } = await import("./src/session.js");
-      const cfg = readConfig();
+      const cfg = readConfig({ codexPolicyMode: "skip" });
       createSessionStore(cfg.envDir, cfg.cwd).clear();
       console.log("✓ Cleared the persistent agent session. The next turn starts a fresh thread.");
       break;
@@ -112,8 +134,9 @@ function printHelp() {
 
 Usage:
   riffn-bridge init        Setup wizard: detect agent, token, verify Tailscale, print QR, run.
-                           --agent claude|codex picks the CLI agent explicitly (else detection
-                           prefers claude). For any other CLI use RIFFIN_BRIDGE_AGENT=custom.
+                           --agent claude picks the supported CLI agent explicitly.
+                           Direct Codex is disabled; route OpenAI models through Claude Code.
+                           For any other CLI use RIFFIN_BRIDGE_AGENT=custom.
                            --edit-mode disabled|limited|ungated skips the edit-capability
                            prompt (ungated still requires the typed acknowledgement, so it
                            needs an interactive terminal).
@@ -121,7 +144,7 @@ Usage:
                            and pick models, or --llm <url> for any OpenAI-compatible endpoint,
                            or --openclaw for an OpenClaw gateway. Runs an LLM proxy by default;
                            add --link-only to print a direct QR without running anything.
-  riffn-bridge start       Start using existing .env / environment.
+  riffn-bridge start       Start using project-keyed state / environment.
   riffn-bridge tts [url]   Voice pairing wizard: asks for your TTS server's URL (or takes it
                            as an argument), verifies it, prints the QR, and runs. Scan in
                            Riffn → Settings → Voice → Voice on My Machine. Add --yes to accept

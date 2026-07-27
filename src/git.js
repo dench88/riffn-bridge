@@ -102,3 +102,26 @@ export function snapshotRepoRing(cwd, keep = SNAPSHOT_RING_SIZE) {
   } catch { /* prune is best-effort — see above */ }
   return snap;
 }
+
+// Compare the current non-ignored working-tree bytes with a snapshot without changing the real
+// index. The same temporary-index strategy includes both tracked and previously untracked files.
+export function changedFilesSinceSnapshot(cwd, snapshotCommit) {
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "riffn-diff-"));
+  const tmpIndex = path.join(tmpDir, "index");
+  const env = { GIT_INDEX_FILE: tmpIndex };
+  try {
+    let head = null;
+    try { head = git(cwd, ["rev-parse", "--verify", "HEAD"]); } catch { /* unborn branch */ }
+    if (head) git(cwd, ["read-tree", "HEAD"], env);
+    else git(cwd, ["read-tree", "--empty"], env);
+    git(cwd, ["add", "-A"], env);
+    const currentTree = git(cwd, ["write-tree"], env);
+    const snapshotTree = git(cwd, ["rev-parse", `${snapshotCommit}^{tree}`]);
+    const output = git(cwd, [
+      "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", snapshotTree, currentTree,
+    ]);
+    return output ? output.split("\0").filter(Boolean).sort() : [];
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+}

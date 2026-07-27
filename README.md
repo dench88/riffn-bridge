@@ -1,8 +1,15 @@
 # @riffn/bridge
 
 Voice-drive **your own** agent from Riffn. A tiny, **zero-dependency** Node helper that presents an
-**OpenAI-compatible** `/v1/chat/completions` endpoint and forwards each turn to a local CLI agent —
-**Claude Code** (`claude -p`) or **Codex** — on your own always-on machine, reached over Tailscale.
+**OpenAI-compatible** `/v1/chat/completions` endpoint and forwards each turn to **Claude Code**
+(`claude -p`) or a configured custom agent on your own always-on machine, reached over Tailscale.
+
+> **Direct Codex bridges are disabled.** On native Windows, Codex shell subprocesses can bypass
+> file-read denials. WSL2 support is postponed. To use an OpenAI/GPT model, run it through the
+> Claude Code harness using an Anthropic-compatible gateway such as LiteLLM; see below.
+
+The product name is **Riffn**. `@riffn/bridge`, `riffn-bridge`, `.riffin-bridge`, and the repository
+folder `riffin` are retained technical identifiers.
 
 Because Riffn already talks OpenAI-compatible HTTP to a pasted **Model URL**, you point Riffn at this
 helper and talk to the agent on your own machine — **no app changes, no worker changes, no deploy.**
@@ -12,7 +19,7 @@ helper and talk to the agent on your own machine — **no app changes, no worker
 > explicit choice, made on this machine, never from the phone — `RIFFIN_BRIDGE_EDIT_MODE`:
 > **disabled** (default: no writes anywhere), **limited** (one voice-confirmed edit task at a
 > time, snapshot-first), or **ungated** (any turn may edit — requires typing an acknowledgement
-> at `init`). See "Edit modes" below, including what each tier honestly means on Codex.
+> at `init`). See "Edit modes" below.
 
 This is the **Phase 1.5 minimal cut** of the bridge plan: link + trust, deliberately small.
 
@@ -21,7 +28,7 @@ This is the **Phase 1.5 minimal cut** of the bridge plan: link + trust, delibera
 ## Requirements
 
 - Node 18+
-- An agent CLI installed: `claude` (Claude Code) or `codex`
+- `claude` (Claude Code) installed
 - [Tailscale](https://tailscale.com/) running on this machine **and** on your phone
 
 ## Quick start
@@ -29,7 +36,7 @@ This is the **Phase 1.5 minimal cut** of the bridge plan: link + trust, delibera
 In the repo (working directory) you want to talk to:
 
 ```bash
-npx @riffn/bridge@0.4.3 init
+npx @riffn/bridge@0.6.0 init
 ```
 
 **Pin the version** (as above) rather than running a floating `npx @riffn/bridge` — you're
@@ -61,7 +68,7 @@ this helper over your own tailnet, and the helper drives the agent CLI you alrea
 v1 is deliberately a **foreground process** — no background service is installed on your
 machine (that's a feature until you decide otherwise). Practical recipes:
 
-- **tmux / screen:** `tmux new -s riffn-bridge`, run `npx @riffn/bridge@0.4.3 start`, detach
+- **tmux / screen:** `tmux new -s riffn-bridge`, run `npx @riffn/bridge@0.6.0 start`, detach
   (`Ctrl-B D`). Survives closing the terminal window; not a reboot.
 - **Keep the machine awake:** macOS `caffeinate -s`, Windows *Settings → Power → never sleep
   when plugged in* (or `powercfg /change standby-timeout-ac 0`), Linux inhibit as you prefer.
@@ -80,8 +87,8 @@ a scannable code, or paste the payload into Riffn's manual-link field.)
 
 | Command | What it does |
 |---|---|
-| `riffn-bridge init` | Setup wizard: detect agent, token, verify Tailscale, print QR, run foreground. `--agent claude\|codex` picks the CLI agent explicitly (persisted to `.env`); otherwise detection prefers Claude. `--edit-mode disabled\|limited\|ungated` skips the edit-capability prompt (ungated still requires the typed acknowledgement — see "Edit modes"). |
-| `riffn-bridge start` | Start using existing `.env` / environment. |
+| `riffn-bridge init` | Setup wizard: detect Claude Code, generate a token, verify Tailscale, print QR, run foreground. State is stored outside the workspace under `~/.riffin-bridge/<project-key>/`. |
+| `riffn-bridge start` | Start using the project-keyed state directory / environment. |
 | `riffn-bridge rotate` | Generate a new bearer token (invalidates the old QR). |
 | `riffn-bridge reset-session` | Clear the persistent agent session (next turn starts fresh). |
 | `riffn-bridge health` | Print effective config (redacted) without starting. |
@@ -91,9 +98,8 @@ a scannable code, or paste the payload into Riffn's manual-link field.)
 
 - `GET /` — public liveness (`{status, version}`), no secrets.
 - `GET /health` — **authenticated**; returns `{mode, agent, cwd (redacted), tts, caps, capabilities,
-  version}`. `capabilities` is the structured permission report — `{editMode, chatWrites, editJobs,
-  shell, snapshotPolicy}` — because file-edit permission and shell permission are independent axes
-  one `caps` string can't carry (Codex runs a sandboxed shell even read-only; Claude never runs one).
+  codexPolicy, version}`. `capabilities` is the structured permission report — `{editMode, chatWrites, editJobs,
+  shell, sensitivePaths, snapshotPolicy}` — because one `caps` string cannot express each boundary.
   This is what the app shows after pairing.
 - `POST /v1/chat/completions` — the chat turn. **Single-flight**: a second concurrent turn gets `429`
   rather than spawning a second agent against the same directory. Cancels the agent if the client
@@ -118,14 +124,14 @@ Use `https://<machine>.<tailnet>.ts.net/v1` as the Model URL.
 - **Read/plan-only by default** — chat turns and plain jobs never get write permission unless the
   operator chose an edit mode on this machine (see "Edit modes" below): `limited` is two-key armed
   (workstation opt-in + per-task spoken confirmation), `ungated` requires a typed acknowledgement
-  at `init`. Claude never gets command execution at any tier; Codex's sandbox contains what
-  commands can do, not whether they run — stated honestly per tier below.
+  at `init`. Claude never gets command execution at any tier.
 - **Which model answers is your CLI's choice, not the bridge's** — the bridge never passes a model
-  flag. Claude uses your Claude Code install's configured default; Codex (run with an isolated
-  config — see the Codex note below) uses its built-in default. If model cost matters to you, set
-  your CLI's default deliberately before pairing.
+  flag. Claude Code uses its configured default or the model selected by your configured gateway.
+  Set that deliberately before pairing.
 - **Tailnet-only bind** by default; refuses `0.0.0.0` unless `RIFFIN_BRIDGE_ALLOW_PUBLIC=1`.
 - **Bearer token** on every request (constant-time compare); 1 MB body cap.
+- Bridge state, tokens, sessions, parked Codex probe attestations, snapshots, and audit logs live
+  outside the agent workspace. Startup refuses a state directory inside that workspace.
 - Agent/TTS invoked with **argument arrays**, never a shell string.
 - **Single-flight** + per-request **timeout & cancel**.
 - **Redact-by-default logs** — token, prompts, code, cwd, subprocess args, and URLs are never logged
@@ -148,16 +154,15 @@ done. Endpoints:
   never file contents), and the result once done.
 - `POST /v1/jobs/cancel` → stop the running job.
 
-One job at a time per bridge (same cwd-safety as chat). Job state is a small local file
-(`.riffn-bridge-job.json`, next to `.env` — gitignored); a job left running when the helper is
+One job at a time per bridge (same cwd-safety as chat). Job state is a small local file in the
+outside-workspace bridge state directory; a job left running when the helper is
 restarted is reported as `interrupted`, not a forever-"running" lie. By voice: *"run a task: …"*,
 *"how's my task going?"*, *"read me the result"*, *"stop my task"*.
 
 ## Edit modes — disabled / limited / ungated
 
-One operator control, chosen at `init` (or `RIFFIN_BRIDGE_EDIT_MODE` in `.env`), same meaning for
-every agent. It can never be changed from the phone — a paired phone, or a stolen token, cannot
-raise its own permissions.
+One operator control, chosen at `init` (or `RIFFIN_BRIDGE_EDIT_MODE` in `.env`). It can never be
+changed from the phone — a paired phone, or a stolen token, cannot raise its own permissions.
 
 | Mode | What a turn may do |
 |---|---|
@@ -168,7 +173,7 @@ raise its own permissions.
 (`full-access` / `always-edit` are deprecated spellings of `ungated` and warn on start. The old
 `RIFFIN_BRIDGE_ALLOW_EDIT_JOBS=1` boolean still reads as `limited` — for Claude only; an arming
 decision never carries to a different agent, which is also why `init` stamps the mode with the
-agent it was chosen for and degrades to `disabled` if you later switch agents by hand.)
+  agent it was chosen for and degrades to `disabled` if you later switch agents by hand.)
 
 ### `limited` — voice-confirmed edit tasks (Claude only)
 
@@ -180,10 +185,11 @@ subagents, and no MCP/external tools (no email, calendar, remote triggers).
 **How that's enforced (defence in depth):** the edit task runs under a **PreToolUse hook**
 (`src/edit-guard-hook.js`) that Claude Code consults before *every* tool call — it allows only
 Read/Edit/Write/Glob/Grep/web and denies everything else, and a hook deny holds even in bypass
-mode. Write tools are additionally denied any target outside the working directory (a path
-boundary, fail-closed on a missing path — reads and web stay unrestricted). Backed by `--permission-mode dontAsk` + an explicit allowlist, `--strict-mcp-config` (zero
-MCP servers), and a deny list for known exec tools. Any tool outside the allowlist — named or not,
-now or in a future CLI — is denied because it isn't allowed, not because we remembered it.
+mode. File tools are confined to the working directory; environment/worker secret files cannot be
+read or written; and host-consumed automation/dependency subtrees cannot be written. Missing paths
+fail closed. The live bridge package directory is also write-protected, including when running
+from source inside the bridged repo. This is backed by `--permission-mode dontAsk` + an explicit allowlist,
+`--strict-mcp-config` (zero MCP servers), and a deny list for known exec tools.
 
 Arming is **two-key**, and both keys are yours: (1) this machine — choose `limited` at `init`;
 (2) your voice — the app dispatches an edit task only after you say "execute the plan" AND confirm
@@ -193,25 +199,20 @@ the spoken warning. A `caps:"edit"` dispatch without the workstation key gets a 
 
 Every turn (chat or job) runs write-capable, no ceremony. Enabling it requires typing
 `yes i understand` at `init` — a script, `--yes`, or `--edit-mode ungated` in a non-interactive
-terminal can never arm it. What it means differs by agent, and the warning says so:
+terminal can never arm it:
 
-- **Claude:** the SAME containment as `limited` (hook allowlist, no commands, no git, no MCP) —
-  ungated removes the per-task confirmation, it does not move the command-execution boundary.
-  Every write-capable turn snapshots the repo first into a pruned ring
-  (`refs/riffn/ring-*`, last 20 kept), and the persistent session is stamped with the mode it was
-  created under — flipping the mode starts a fresh thread, so a permissive session can never leak
-  into a stricter mode (or vice versa).
-- **Codex:** honestly, **sandboxed shell + workspace edits** (`--sandbox workspace-write`) —
-  Codex's sandbox scopes what model-run commands can *do*, not *whether* they run. No automatic
-  snapshots; rely on your own git discipline.
+The same Claude containment as `limited` remains in force (hook allowlist, no commands, no git,
+no MCP); `ungated` removes only the per-task confirmation. Every write-capable turn snapshots the
+repo first into a pruned ring (`refs/riffn/ring-*`, last 20 kept), and the persistent session is
+mode-stamped so a permissive session cannot leak into a stricter mode.
 
 ### Snapshots and recovery
 
 Before any write-capable Claude run, the helper (never the agent) captures the full repo state —
 including uncommitted and untracked files — as a ref. Nothing visible changes (no commit on your
 branch, no stash entry). If the snapshot can't be taken (not a git repo, git missing), the run is
-**refused**, not run unprotected. `limited` tasks keep one ref per task
-(`refs/riffn/snapshot-<jobid>`, never auto-pruned); `ungated` turns cycle through the ring.
+**refused**, not run unprotected. `limited` Claude tasks keep one ref per task
+(`refs/riffn/snapshot-<jobid>`, never auto-pruned); ungated turns cycle through the ring.
 
 ```bash
 git diff <ref>                     # review MODIFIED tracked files
@@ -222,14 +223,12 @@ git for-each-ref refs/riffn        # list all snapshot/ring refs; delete with up
 
 Job status reports the **count** of file edits only — never file names or contents (§10.10).
 
-### A note on Codex containment (all modes)
+### Direct Codex is parked
 
-`codex exec` has no deny-by-default, so the bridge pins the whole posture on every turn:
-`--sandbox` (read-only below ungated), `--ignore-user-config` (your `~/.codex/config.toml` — MCP
-servers, hooks, web search, and your model choice — never loads under the bridge; auth still works),
-`approval_policy=never`, and a core-only shell environment. Bridge secrets (`RIFFIN_BRIDGE_*`)
-are stripped from every spawned agent's environment, Claude included. A Codex CLI too old for
-these flags fails the turn rather than running uncontained.
+`RIFFIN_BRIDGE_AGENT=codex` and `--agent codex` fail closed with
+`disabled-by-policy`. The dormant pinned profiles, exact-version gate, audit code, and disposable
+probe remain in the package so a future upstream fix can be tested before re-enable. A release may
+restore direct Codex only after the complete probe passes; a version bump alone is insufficient.
 
 ## Voice notes
 
@@ -244,26 +243,53 @@ content), or *"make a note"* / *"note that"* (saves the last exchange).
 
 Once you're paired, the bridge keeps **one continuing Claude Code conversation** on this machine —
 each turn resumes it via `claude --resume`, instead of starting a memory-less session every time.
-The session survives helper restarts (it's a small local file, `.riffn-bridge-session.json`, next to
-`.env` — gitignored, never sent to the phone). Point the bridge at a different working directory and
+The session survives helper restarts (it's a small local file in the outside-workspace project state
+directory, never sent to the phone). Point the bridge at a different working directory and
 it starts a fresh thread automatically. If a resume ever fails (corrupted/expired session), the
 helper self-heals by starting a new thread rather than erroring. Run `riffn-bridge reset-session`
-any time you want to start over on purpose. Codex doesn't have this wired yet — it stays stateless.
+any time you want to start over on purpose.
 
 Note this is a session on **this machine**, not this terminal/IDE — it's a separate `claude -p`
 process each turn, so it won't show up in an interactive `claude` session you have open elsewhere.
 
-## Run it on GLM (or any Anthropic-compatible backend)
+## Run an OpenAI or other model through Claude Code
 
-The `claude` CLI doesn't have to talk to Anthropic: it honors standard env vars that redirect it
-to any Anthropic-compatible endpoint — Z.ai's GLM models, OpenRouter, a local proxy. The bridge
-follows along for free: it spawns *your* `claude` install, passes your environment through, and
-never picks a model itself. Net effect: voice-driving a ~$3/M-token model in your own repo, from
-your phone.
+The bridge always uses the Claude Code harness, but that harness can be pointed at an
+Anthropic-compatible gateway. This preserves the bridge's no-shell/tool policy while changing the
+model behind it. Gateway and model compatibility remain the operator's responsibility. See
+[Anthropic's LLM gateway guide](https://docs.anthropic.com/en/docs/claude-code/llm-gateway).
 
 Add the redirect to the **bridge's `.env`** (scoped to this one bridge — loaded at start and passed
 to the spawned agent), or to the `env` block of `~/.claude/settings.json` (machine-wide). Direct
-to Z.ai, for example (check their docs for current model ids):
+Codex is not used.
+
+### OpenAI through LiteLLM
+
+Run a local LiteLLM proxy with your OpenAI API key and chosen API model:
+
+```powershell
+$env:OPENAI_API_KEY = "<your OpenAI API key>"
+litellm --model gpt-5.5
+```
+
+Then put these values in the bridge's outside-workspace `.env`:
+
+```text
+ANTHROPIC_BASE_URL=http://localhost:4000
+ANTHROPIC_AUTH_TOKEN=<your LiteLLM proxy master key>
+ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.5
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.5
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.5-mini
+```
+
+Use model identifiers actually available to your OpenAI API project. OpenRouter, Azure OpenAI,
+or a self-hosted translation proxy can be substituted. This uses OpenAI API billing; a ChatGPT or
+Codex subscription does not supply the API key. LiteLLM is third-party software and holds the
+OpenAI key, so keep the proxy local, authenticate it, and update it deliberately.
+
+### GLM example
+
+Direct to Z.ai (check their docs for current model ids):
 
 ```
 ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
@@ -286,14 +312,13 @@ Notes:
   identically on any backend.
 - **Fleets compose.** Because the `.env` is per-bridge, one repo can answer on GLM while another
   answers on Anthropic, side by side on the same machine.
-- Claude agent only — Codex under the bridge runs with an isolated config (see the Codex note)
-  and its own built-in default.
+- Claude agent only; direct Codex is disabled.
 - If turns stall or come back malformed, suspect the backend model's tool-calling before the
   bridge: `claude -p "hello" --output-format json` in the working directory shows the raw error.
 
 ## Custom CLI agents (any model working on a repo)
 
-Beyond Claude Code and Codex, any coding-agent CLI works via `RIFFIN_BRIDGE_AGENT=custom` +
+Beyond Claude Code, any coding-agent CLI works via `RIFFIN_BRIDGE_AGENT=custom` +
 `RIFFIN_BRIDGE_AGENT_BIN` + `RIFFIN_BRIDGE_AGENT_ARGS` (a template where `{prompt}` becomes one
 argument — argument array, never a shell). Example for aider against any OpenAI-compatible endpoint:
 
@@ -309,7 +334,7 @@ app shows the honest state. Custom agents are stateless (no session continuity y
 
 ## Running several bridges on one machine
 
-Each bridge needs its **own launch folder** (session state lives there) and its **own port** —
+Each bridge gets its own project-keyed state directory and needs its **own port** —
 `init` auto-picks a free port and saves it; `start` on a busy port fails with instructions. Give
 each machine a **speakable name** when pairing: "Switch to *name*" changes machines by voice.
 
@@ -321,7 +346,9 @@ link, trust, talk (read/plan-only), over Tailscale.
 
 ## Troubleshooting
 
-- **"No agent found"** — install `claude` or `codex` (or set `RIFFIN_BRIDGE_CLAUDE_BIN`).
+- **"No supported agent found"** — install `claude` or set `RIFFIN_BRIDGE_CLAUDE_BIN`.
+- **"Codex bridge disabled (disabled-by-policy)"** — expected. Configure Claude Code directly or
+  route an OpenAI model through it as described above.
 - **"Not ready to pair" / Tailscale** — the wizard tells you exactly what to run (`tailscale up`); it
   never runs privileged commands for you.
 - **401 from Riffn** — the paired token must exactly match `RIFFIN_BRIDGE_TOKEN`. Rotated it? Re-pair.
@@ -331,7 +358,7 @@ link, trust, talk (read/plan-only), over Tailscale.
 
 ## Releasing (maintainers)
 
-The source of truth is `tools/riffin-bridge` in the riffin monorepo; the standalone
+The source of truth is `tools/riffin-bridge` in the Riffn monorepo (legacy folder `riffin`); the standalone
 `riffn-bridge` GitHub repo is a **write-only publish mirror** (it exists so CI can publish to
 npm without dragging the app monorepo along). Never publish any other way — versions 0.3–0.5
 were once published around the mirror and it silently fell months behind.

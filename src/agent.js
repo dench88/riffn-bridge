@@ -14,9 +14,72 @@
 // yet and stays stateless (documented limitation, not an oversight).
 
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { errorType, log } from "./log.js";
-import { EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS } from "./edit-policy.js";
+import {
+  EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS, READ_JOB_ALLOWED_TOOLS,
+} from "./edit-policy.js";
 import { resolveSpawnTarget } from "./win-shim.js";
+import {
+  assertDirectCodexEnabled, assertNoProjectCodexConfig, CODEX_READ_PROFILE, CODEX_WRITE_PROFILE,
+} from "./codex-policy.js";
+
+export const CODEX_DISABLED_FEATURES = Object.freeze([
+  "apps",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "computer_use",
+  "hooks",
+  "in_app_browser",
+  "multi_agent",
+  "plugins",
+  "plugin_sharing",
+  "remote_plugin",
+  "skill_mcp_dependency_install",
+  "workspace_dependencies",
+]);
+
+function tomlQuoted(value) {
+  return JSON.stringify(String(value));
+}
+
+export function codexPermissionOverrides(cfg) {
+  const profile = cfg.editMode === "ungated" ? CODEX_WRITE_PROFILE : CODEX_READ_PROFILE;
+  const workspaceAccess = profile === CODEX_WRITE_PROFILE ? "write" : "read";
+  const cwdKey = tomlQuoted(path.resolve(cfg.cwd));
+  const workspaceRules = [
+    `"." = "${workspaceAccess}"`,
+    `".venv" = "read"`,
+    `".vscode" = "read"`,
+    `".claude" = "read"`,
+    `".agents" = "read"`,
+    `"node_modules" = "read"`,
+    `"workers/node_modules" = "read"`,
+    `".env" = "deny"`,
+    `"*.env" = "deny"`,
+    `"**/*.env" = "deny"`,
+    `"workers/.dev.vars*" = "deny"`,
+  ].join(", ");
+  return [
+    `projects.${cwdKey}.trust_level="untrusted"`,
+    `default_permissions="${profile}"`,
+    `permissions.${profile}.description="Riffn bridge pinned ${workspaceAccess} profile"`,
+    `permissions.${profile}.extends=":workspace"`,
+    `permissions.${profile}.filesystem={ ":root" = "deny", ":minimal" = "read", glob_scan_max_depth = 64, ":workspace_roots" = { ${workspaceRules} } }`,
+    `permissions.${profile}.network.enabled=false`,
+    `approval_policy="never"`,
+    `shell_environment_policy.inherit="core"`,
+    `windows.sandbox="elevated"`,
+    `web_search="disabled"`,
+    `mcp_servers={}`,
+    ...CODEX_DISABLED_FEATURES.map((feature) => `features.${feature}=false`),
+  ];
+}
+
+export function codexPolicyArgs(cfg) {
+  return codexPermissionOverrides(cfg).flatMap((override) => ["-c", override]);
+}
 
 function contentText(content) {
   return typeof content === "string"
@@ -83,7 +146,7 @@ function lastUserMessage(messages) {
 //   "ungated" — the ungated tier (Claude): containment + RESUMABLE mode-stamped session +
 //               per-turn ring snapshot; applies to every turn, requested or not
 // The 403 for a caps:"edit" request against a disabled machine stays in server.js (it's a wire
-// error, not a derivation). Codex never reaches here for writes — its posture is the sandbox flag.
+// error, not a derivation). Codex writes are governed by its pinned permission profile.
 export function effectiveCaps(cfg, requestedCaps) {
   if (cfg.mode !== "cli" || cfg.agent !== "claude") return "read";
   if (cfg.editMode === "ungated") return "ungated";
@@ -96,54 +159,42 @@ export function effectiveCaps(cfg, requestedCaps) {
 // Build the agent command. For claude (below ungated), and codex below ungated: READ/PLAN-ONLY —
 // no permission-escalation flags are ever added here. For a CUSTOM agent the helper cannot enforce
 // that (the operator's own agent config decides what it may do) — see customAgentCapsWarning/
-// agentCaps. Exported (pure) so tests can pin the sandbox/permission flags without spawning.
-// `edit` ({ settingsPath, mcpConfigPath } | null): when set, a Claude turn runs under the SAME
-// four-layer containment as an edit job (edit-policy.js) with file writes allowed — the ungated
-// chat path. Never set for read/plan turns.
-export function agentCommand(cfg, prompt, sessionId, appendSystemPrompt, edit = null) {
+// agentCaps. Exported (pure) so tests can pin the full permission argv without spawning.
+// `security` contains the empty MCP config and mode-specific hook settings generated outside the
+// workspace. It is required for every Claude turn so user/global permissions cannot widen the
+// bridge's read or write posture.
+export function agentCommand(cfg, prompt, sessionId, appendSystemPrompt, security = null) {
   if (cfg.agent === "claude") {
-    // Headless `claude -p` cannot answer interactive permission prompts, so tool actions requiring
-    // permission are denied by default — which is exactly the read/plan-only posture we want in v1.
+    if (!security) throw new Error("Claude bridge refused: tool containment was not prepared.");
     const args = ["-p", prompt, "--output-format", "json"];
-    if (edit) {
-      // Same defence-in-depth set as buildJobArgs (jobs.js) — hook is the guarantee, the rest
-      // fail-closed backup. Passed on EVERY ungated turn: the flags bind at session creation and
-      // are harmless on resume, and the mode-stamped session store guarantees any resumed session
-      // was itself created under ungated (i.e. with this exact set).
-      args.push("--settings", edit.settingsPath);
-      args.push("--permission-mode", "dontAsk");
-      args.push("--strict-mcp-config", "--mcp-config", edit.mcpConfigPath);
-      args.push("--allowedTools", ...EDIT_JOB_ALLOWED_TOOLS);
-      args.push("--disallowedTools", ...EDIT_JOB_DISALLOWED_TOOLS);
-    }
+    const writeCapable = cfg.editMode === "ungated";
+    args.push("--settings", writeCapable ? security.editSettingsPath : security.readSettingsPath);
+    args.push("--permission-mode", "dontAsk");
+    args.push("--strict-mcp-config", "--mcp-config", security.mcpConfigPath);
+    args.push("--allowedTools", ...(writeCapable ? EDIT_JOB_ALLOWED_TOOLS : READ_JOB_ALLOWED_TOOLS));
+    args.push("--disallowedTools", ...EDIT_JOB_DISALLOWED_TOOLS);
     if (sessionId) args.push("--resume", sessionId);
     if (appendSystemPrompt) args.push("--append-system-prompt", appendSystemPrompt);
     return { bin: cfg.claudeBin, args };
   }
   if (cfg.agent === "codex") {
-    // Unlike Claude, `codex exec` has no deny-by-default: with no flags it inherits the operator's
-    // own ~/.codex/config.toml — sandbox choice, approval policy, MCP servers, hooks, web search —
-    // which is how the 2026-07-16 dogfood edited files while /health claimed read-plan
-    // (edit_mode_plan.md). Pin the whole posture EVERY turn, not just the sandbox:
-    //   --sandbox                pinned; read-only unless the operator chose ungated. Codex's
-    //                            sandbox scopes what model-run shell commands can DO, not whether
-    //                            they run — ungated on Codex is "sandboxed shell + workspace
-    //                            edits" by explicit accept-and-label decision (see the plan).
-    //   --ignore-user-config     the operator's config.toml (MCP servers, hooks, web search,
-    //                            features) never loads under the bridge; auth still uses CODEX_HOME.
-    //   -c approval_policy=never pinned, not inherited.
-    //   -c shell_environment_policy.inherit=core   model-run commands see only core env vars.
-    // Fail-closed by construction: a Codex too old for these flags exits with a usage error and
-    // the turn fails — it never falls back to an uncontained invocation.
-    const sandbox = cfg.editMode === "ungated" ? "workspace-write" : "read-only";
+    // Kept reachable only to the disposable security probe and argv unit tests. Normal config has
+    // no way to set this internal marker, so even a caller that bypasses startup validation cannot
+    // launch the parked direct-Codex path accidentally.
+    if (!cfg.codexProbeMode) assertDirectCodexEnabled();
+    assertNoProjectCodexConfig(cfg.cwd);
+    // Pin a named permission profile and every native automation surface on every turn. Never add
+    // --sandbox: any loaded legacy sandbox setting disables permission-profile enforcement.
+    // Project .codex/config.toml is refused above because current Codex has no flag that ignores it.
     return {
       bin: cfg.codexBin,
       args: [
         "exec",
-        "--sandbox", sandbox,
         "--ignore-user-config",
-        "-c", "approval_policy=never",
-        "-c", "shell_environment_policy.inherit=core",
+        "--strict-config",
+        "--ignore-rules",
+        "--ephemeral",
+        ...codexPolicyArgs(cfg),
         prompt,
       ],
     };
@@ -174,7 +225,7 @@ export function agentCaps(cfg) {
   // Ungated: turns themselves may write — a distinct caps value so /health (and the app) never
   // label the permissive tier with a read-only-sounding string. Kept for backward compatibility
   // now that agentCapabilities (below) carries the per-axis truth.
-  if (cfg.agent === "codex") return cfg.editMode === "ungated" ? "ungated" : "read-plan";
+  if (cfg.agent === "codex") return "disabled-by-policy";
   if (cfg.agent === "claude" && cfg.editMode === "ungated") return "ungated";
   if (cfg.agent === "claude" && cfg.allowEditJobs) return "read-plan+edit-jobs";
   return "read-plan";
@@ -193,10 +244,15 @@ export function agentCapabilities(cfg) {
   const ungated = editMode === "ungated";
   if (cfg.agent === "codex") {
     return {
+      availability: "disabled-by-policy",
       editMode,
-      chatWrites: ungated,
-      editJobs: false, // Codex has no jobs path (501) — the confirm-gated task tier can't arm
-      shell: ungated ? "workspace-write" : "read-only",
+      chatWrites: false,
+      editJobs: false,
+      shell: "disabled-by-policy",
+      permissionProfile: null,
+      dormantPermissionProfile: ungated ? CODEX_WRITE_PROFILE : CODEX_READ_PROFILE,
+      commandNetwork: "not-applicable",
+      sensitivePaths: "not-enforceable-on-native-windows-shell",
       snapshotPolicy: "none",
     };
   }
@@ -205,6 +261,7 @@ export function agentCapabilities(cfg) {
     chatWrites: ungated,
     editJobs: editMode === "limited" || ungated,
     shell: "none", // Bash is denied at every Claude tier — containment, not configuration
+    sensitivePaths: "protected-by-file-tool-policy",
     snapshotPolicy: ungated ? "per-turn-ring" : (editMode === "limited" ? "per-task" : "none"),
   };
 }
@@ -254,9 +311,9 @@ export function extractResult(stdout) {
 
 // Run the CLI agent. Honors an AbortSignal so the caller can cancel on client disconnect/timeout —
 // the child is SIGKILLed and its output discarded. Resolves { text, sessionId }.
-function runAgent(cfg, prompt, signal, sessionId, appendSystemPrompt, edit = null) {
+function runAgent(cfg, prompt, signal, sessionId, appendSystemPrompt, security = null) {
   return new Promise((resolve, reject) => {
-    const { bin, args } = agentCommand(cfg, prompt, sessionId, appendSystemPrompt, edit);
+    const { bin, args } = agentCommand(cfg, prompt, sessionId, appendSystemPrompt, security);
     // Windows: `bin` may be an npm-generated .cmd shim (no raw .exe) — resolve it to a directly
     // spawnable target rather than shelling out (see win-shim.js for why shell:true is unsafe here).
     const { bin: resolvedBin, prefixArgs } = resolveSpawnTarget(bin);
@@ -300,9 +357,9 @@ function runAgent(cfg, prompt, signal, sessionId, appendSystemPrompt, edit = nul
 
 // Produce reply text from either the HTTP LLM (Mode B proxy) or the CLI agent (Mode A). `session`
 // (from session.js) is the persistent-thread store; pass null/undefined for stateless behavior
-// (Mode B, or Codex). `edit` (ungated Claude chat only — see agentCommand): the caller (server.js)
-// has already taken the per-turn snapshot and prepared the containment files before passing this.
-export async function generateText(cfg, messages, requestedModel, signal, session, edit = null) {
+// (Mode B, or Codex). `security` is mandatory for Claude turns; for ungated chat the caller has
+// also taken the per-turn snapshot.
+export async function generateText(cfg, messages, requestedModel, signal, session, security = null) {
   // Diagnostic trace (RIFFIN_BRIDGE_VERBOSE=1 only) — answers "which physical bridge/directory/
   // session actually served this turn," the exact question a cross-topic reply raises. cwd is the
   // full path here (not the redacted basename /health sends to the phone) because this is a local
@@ -333,7 +390,9 @@ export async function generateText(cfg, messages, requestedModel, signal, sessio
   if (cfg.agent !== "claude" || !session) {
     // Codex, or no session store configured: stateless flatten every turn (Phase 1 behavior). No
     // --append-system-prompt wiring for Codex yet, so system content stays in the flattened blob.
-    const { text } = await runAgent(cfg, buildPrompt(messages), signal, undefined);
+    const { text } = await runAgent(
+      cfg, buildPrompt(messages), signal, undefined, undefined, security
+    );
     return text;
   }
 
@@ -347,7 +406,7 @@ export async function generateText(cfg, messages, requestedModel, signal, sessio
     log.debug("session_resume", `cwd=${cfg.cwd} session=${existingId}`);
     try {
       const { text, sessionId } = await runAgent(
-        cfg, lastUserMessage(messages), signal, existingId, appendSystemPrompt, edit
+        cfg, lastUserMessage(messages), signal, existingId, appendSystemPrompt, security
       );
       session.set(sessionId || existingId);
       return text;
@@ -361,7 +420,7 @@ export async function generateText(cfg, messages, requestedModel, signal, sessio
   }
   log.debug("session_fresh", `cwd=${cfg.cwd}`);
   const { text, sessionId } = await runAgent(
-    cfg, buildTurnsOnly(messages), signal, undefined, appendSystemPrompt, edit
+    cfg, buildTurnsOnly(messages), signal, undefined, appendSystemPrompt, security
   );
   log.debug("session_started", `cwd=${cfg.cwd} newSession=${sessionId}`);
   session.set(sessionId);

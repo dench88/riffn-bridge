@@ -28,9 +28,14 @@ import { detect, instructions, magicDNSName } from "./tailscale.js";
 import { printPairing, pairingPayloadLLM, clearPairingFromTerminal } from "./qr.js";
 import { startServer } from "./server.js";
 import { ask, findFreePort } from "./init.js";
+import {
+  assertNoLegacyEnv, assertStateOutsideWorkspace, ensureStateDir, resolveStateDir,
+} from "./state.js";
 
 const OLLAMA_DEFAULT = "http://127.0.0.1:11434";
 const OPENCLAW_DEFAULT_PORT = 18789;
+const RESERVED_NAME_WARNING =
+  '⚠️  Do not use "ASSISTANT", "PROJECTS", or "RIFFN CLOUD" as names, or Riffn may confuse them with existing features.';
 
 // ── Small pure helpers (exported for tests) ─────────────────────────────────────────────────
 
@@ -129,6 +134,7 @@ async function resolveExplicitURL(rawURL, yes) {
     if (!/^y/i.test(goOn)) process.exit(1);
   }
   const defName = prettyName(chatURL.hostname.split(".")[0] || "Custom Agent");
+  console.log(`\n${RESERVED_NAME_WARNING}`);
   const name = yes ? defName : await ask("Name for this agent (you'll say “switch to <name>”)", defName);
   // Opaque routing selector — many harnesses ignore it entirely, but the app requires it non-empty.
   const model = yes ? "default" : await ask("Model string to send (many custom agents ignore this)", "default");
@@ -177,6 +183,7 @@ async function resolveOllama(yes) {
   }
 
   const entries = [];
+  console.log(`\n${RESERVED_NAME_WARNING}`);
   for (const i of indices) {
     const def = prettyName(models[i].name);
     const name = yes ? def : await ask(`Name for ${models[i].name} (you'll say “switch to <name>”)`, def);
@@ -301,7 +308,7 @@ async function runProxy(target, envPath, yes) {
   }
   process.env.RIFFIN_BRIDGE_TOKEN = token;
 
-  const cfg = readConfig();
+  const cfg = readConfig({ codexPolicyMode: "enforce" });
   cfg.host = cfg.host || ts.ip;
 
   // Same stable-port contract as the coding-agent init: probe near the default and PERSIST, so
@@ -417,7 +424,13 @@ async function printLinkOnly(target) {
 export async function runInitLLM(argv) {
   const yes = argv.includes("--yes") || argv.includes("-y");
   const linkOnly = argv.includes("--link-only");
-  const envPath = path.join(process.cwd(), ".env");
+  const cwd = path.resolve(process.env.RIFFIN_BRIDGE_CWD || process.cwd());
+  const stateDir = resolveStateDir(cwd);
+  assertStateOutsideWorkspace(stateDir, cwd);
+  assertNoLegacyEnv(process.cwd(), stateDir);
+  ensureStateDir(stateDir);
+  process.env.RIFFIN_BRIDGE_STATE_DIR = stateDir;
+  const envPath = path.join(stateDir, ".env");
   loadEnvFile(envPath);
 
   console.log("\nriffn-bridge init --llm — put your own models/agents on your phone (Riffn → My Custom Agents).\n");

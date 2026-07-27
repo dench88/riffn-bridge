@@ -20,6 +20,9 @@ export const EDIT_JOB_ALLOWED_TOOLS = [
   "Glob", "Grep", "LS",                                 // navigate the repo
   "WebFetch", "WebSearch",                              // look things up (allowed by decision)
 ];
+export const READ_JOB_ALLOWED_TOOLS = [
+  "Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch",
+];
 
 // Named execution/delegation built-ins, denied as an extra backstop (deny rules apply even in
 // bypass mode). Not the guarantee — the hook is — but cheap insurance against the specific tools
@@ -33,31 +36,64 @@ export function isEditToolAllowed(toolName) {
   return EDIT_JOB_ALLOWED_TOOLS.includes(toolName);
 }
 
-// The write-capable tools and the tool_input field naming their target. Read/Glob/Grep/web stay
-// path-unrestricted — the boundary is on WRITES, because the hook's explicit "allow" bypasses
-// Claude Code's own outside-cwd permission check (the gap this closes: without it, an ungated or
-// edit turn could Write anywhere the OS user can, and the snapshot ring only covers the repo).
-const WRITE_TOOL_PATH_FIELDS = {
-  Edit: "file_path",
-  Write: "file_path",
-  MultiEdit: "file_path",
-  NotebookEdit: "notebook_path",
+export function isReadToolAllowed(toolName) {
+  return READ_JOB_ALLOWED_TOOLS.includes(toolName);
+}
+
+// File tools and the tool_input field naming their target. Glob/Grep/LS may omit the path, which
+// means the pinned cwd. Every other file tool fails closed when its target is absent. The hook's
+// explicit allow bypasses Claude Code's own outside-cwd prompt, so both reads and writes need this
+// bridge-side boundary.
+const FILE_TOOL_PATHS = {
+  Read: { field: "file_path", write: false, optional: false },
+  Glob: { field: "path", write: false, optional: true },
+  Grep: { field: "path", write: false, optional: true },
+  LS: { field: "path", write: false, optional: true },
+  Edit: { field: "file_path", write: true, optional: false },
+  Write: { field: "file_path", write: true, optional: false },
+  MultiEdit: { field: "file_path", write: true, optional: false },
+  NotebookEdit: { field: "notebook_path", write: true, optional: false },
 };
 
-// Path boundary for write tools: the target must resolve INSIDE the job's working directory.
-// Fail-closed like everything else here — a write tool with a missing/unreadable path is denied.
-// This is containment against a confused agent, not a kernel sandbox: symlink escapes are out of
-// scope (SECURITY.md), and non-write tools return true (no path to judge).
-export function isEditPathAllowed(toolName, toolInput, cwd) {
-  const field = WRITE_TOOL_PATH_FIELDS[toolName];
-  if (!field) return true;
-  const target = toolInput?.[field];
-  if (typeof target !== "string" || !target) return false;
-  if (typeof cwd !== "string" || !cwd) return false;
-  const root = path.resolve(cwd);
-  // path.relative is case-insensitive on win32, so "c:\repo" vs "C:\Repo" still compares inside.
+const PROTECTED_WRITE_SEGMENTS = new Set([
+  ".venv", ".vscode", ".claude", ".codex", ".agents", "node_modules",
+]);
+
+function relativeInside(root, target) {
   const rel = path.relative(root, path.resolve(root, target));
-  // Outside iff the walk starts with a ".." segment (a "..foo" FILE inside the root is fine) or
-  // relative() had to fall back to an absolute path (different drive/UNC root on Windows).
-  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) ? rel : null;
+}
+
+function isSensitiveRelativePath(relative) {
+  const parts = relative.split(path.sep).filter(Boolean);
+  const basename = (parts.at(-1) || "").toLowerCase();
+  if (basename === ".env" || basename.endsWith(".env") || basename.startsWith(".env.")) return true;
+  return parts.length >= 2
+    && parts.at(-2).toLowerCase() === "workers"
+    && basename.startsWith(".dev.vars");
+}
+
+function isProtectedWritePath(relative) {
+  return relative.split(path.sep).filter(Boolean)
+    .some((segment) => PROTECTED_WRITE_SEGMENTS.has(segment.toLowerCase()));
+}
+
+// Path boundary for all file tools: targets stay inside cwd, secret files cannot be read or
+// written, and host-consumed automation subtrees cannot be written. This is lexical containment,
+// not a kernel sandbox; symlink/junction escapes remain an accepted limitation in SECURITY.md.
+export function isEditPathAllowed(toolName, toolInput, cwd, options = {}) {
+  const spec = FILE_TOOL_PATHS[toolName];
+  if (!spec) return true; // Web tools have no filesystem target.
+  if (typeof cwd !== "string" || !cwd) return false;
+  const target = toolInput?.[spec.field];
+  if ((target === undefined || target === null || target === "") && spec.optional) return true;
+  if (typeof target !== "string" || !target) return false;
+  const root = path.resolve(cwd);
+  const absoluteTarget = path.resolve(root, target);
+  const relative = relativeInside(root, absoluteTarget);
+  if (relative === null || isSensitiveRelativePath(relative)) return false;
+  if (spec.write && (options.protectedRoots || []).some(
+    (protectedRoot) => relativeInside(path.resolve(protectedRoot), absoluteTarget) !== null
+  )) return false;
+  return !spec.write || !isProtectedWritePath(relative);
 }

@@ -8,7 +8,7 @@
 $src = $PSScriptRoot
 $dst = Join-Path $PSScriptRoot "..\..\..\riffn-bridge"
 if (-not (Test-Path $dst)) {
-    Write-Error "Mirror not found at $dst — clone https://github.com/dench88/riffn-bridge.git next to the riffin folder first."
+    Write-Error "Mirror not found at $dst. Clone https://github.com/dench88/riffn-bridge.git next to the riffin folder first."
     exit 1
 }
 $dst = (Resolve-Path $dst).Path
@@ -20,5 +20,5 @@ if ($LASTEXITCODE -ge 8) {
 }
 Write-Host ""
 Write-Host "Synced $src -> $dst"
-Write-Host "Next: cd $dst ; npm test ; git status ; git add -A ; git commit -m `"riffn-bridge X.Y.Z`" ; git tag vX.Y.Z ; git push origin main --tags"
+Write-Host ('Next: cd {0} ; npm test ; git status ; git add -A ; git commit -m "riffn-bridge X.Y.Z" ; git tag vX.Y.Z ; git push origin main --tags' -f $dst)
 exit 0
