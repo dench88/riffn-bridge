@@ -51,8 +51,11 @@ node index.js init
 
 ## What leaves my machine?
 
-**Nothing goes to Riffn's servers — they are never in the path.** Your phone talks straight to
-this helper over your own tailnet, and the helper drives the agent CLI you already installed:
+**The live model request does not go through Riffn's servers.** Your phone talks straight to this
+helper over your own tailnet, and the helper drives the agent CLI you already installed. Normal app
+services remain separate: Apple speech recognition and the selected voice provider may process
+their respective audio or text, and enabled Cloud History may sync the resulting conversation text
+and generated audio through Riffn's worker.
 
 - Prompts and replies go to **your** model provider (Anthropic / OpenAI) via **your** CLI and
   **your** API account — exactly the same data flow as typing into Claude Code in a terminal.
@@ -301,7 +304,10 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-4.5-air
 
 Via OpenRouter instead: `ANTHROPIC_BASE_URL=https://openrouter.ai/api`, model ids like
 `z-ai/glm-5.2`, and **pin the Z.ai provider in your OpenRouter account settings** — otherwise
-requests may silently route to cheaper quantized third-party hosts of the same model.
+requests may silently route to cheaper quantized third-party hosts of the same model. Also set
+`ANTHROPIC_API_KEY=` explicitly empty; if it is already set in the shell that launches the bridge,
+clear it there because shell environment takes precedence over the bridge state file. If Claude
+Code has a saved Anthropic login, run `/logout` once inside Claude Code and restart it.
 
 Notes:
 
