@@ -18,24 +18,30 @@ import {
   assertNoLegacyEnv, assertStateOutsideWorkspace, ensureStateDir, resolveStateDir,
 } from "./state.js";
 
-// POSTs a short synth request at the given endpoint/model/voice/key and returns true only on a
-// real audio response — catches a wrong URL, wrong model name, or unreachable server BEFORE a
-// QR is printed and handed to the phone, rather than after a failed pairing scan.
+const TTS_VERIFICATION_INPUT = "Riffn voice link verified.";
+
+// POSTs a short synth request at the given endpoint/model/voice/key and returns its audio only
+// when successful — catches a wrong URL, model name, or unreachable server BEFORE a QR is printed
+// and handed to the phone, while retaining the result for the phone's own verification request.
 async function verifyTTSEndpoint(url, model, voice, key) {
   try {
+    // Local neural TTS servers can need well over ten seconds to synthesize their first request,
+    // especially on GPUs near the model's minimum VRAM requirement. Use the bridge's normal
+    // request timeout so onboarding does not reject an otherwise healthy endpoint.
+    const timeoutMs = Number(process.env.RIFFIN_BRIDGE_TIMEOUT_MS || 120_000);
     const headers = { "Content-Type": "application/json" };
     if (key) headers.Authorization = `Bearer ${key}`;
     const resp = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({ model, input: "Riffn voice link verified.", voice, response_format: "mp3" }),
-      signal: AbortSignal.timeout(10_000),
+      body: JSON.stringify({ model, input: TTS_VERIFICATION_INPUT, voice, response_format: "mp3" }),
+      signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!resp.ok) return false;
-    const buf = await resp.arrayBuffer();
-    return buf.byteLength > 0;
+    if (!resp.ok) return null;
+    const bytes = Buffer.from(await resp.arrayBuffer());
+    return bytes.length > 0 ? bytes : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -83,8 +89,8 @@ export async function runInitTTS(argv) {
   // 2. Verify BEFORE writing anything or printing a QR — a typo'd URL should fail loudly here,
   // not as a mystery "couldn't verify" on the phone three steps later.
   console.log("\nVerifying the TTS endpoint…");
-  const verified = await verifyTTSEndpoint(ttsUrl, ttsModel, ttsVoice, ttsKey);
-  if (!verified) {
+  const verificationAudio = await verifyTTSEndpoint(ttsUrl, ttsModel, ttsVoice, ttsKey);
+  if (!verificationAudio) {
     console.error(`✖ ${ttsUrl} didn't return audio for model "${ttsModel}". Check the server is running and the model/voice names match, then try again.`);
     process.exit(1);
   }
@@ -122,6 +128,16 @@ export async function runInitTTS(argv) {
   process.env.RIFFIN_BRIDGE_TOKEN = token;
   const cfg = readConfig({ codexPolicyMode: "enforce" });
   cfg.host = cfg.host || ts.ip;
+  // The phone verifies a scanned voice by requesting this same fixed phrase, but its short
+  // onboarding timeout is intentionally unsuitable for cold-starting a large local TTS model.
+  // We already proved the full upstream path above, so serve that exact result from memory.
+  cfg.ttsVerificationCache = {
+    input: TTS_VERIFICATION_INPUT,
+    model: ttsModel,
+    voice: ttsVoice,
+    format: "mp3",
+    bytes: verificationAudio,
+  };
 
   const freePort = await findFreePort(cfg.host, cfg.port);
   if (freePort === null) {

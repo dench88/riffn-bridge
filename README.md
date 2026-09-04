@@ -36,7 +36,7 @@ This is the **Phase 1.5 minimal cut** of the bridge plan: link + trust, delibera
 In the repo (working directory) you want to talk to:
 
 ```bash
-npx @riffn/bridge@0.6.0 init
+npx @riffn/bridge@0.6.1 init
 ```
 
 **Pin the version** (as above) rather than running a floating `npx @riffn/bridge` — you're
@@ -71,7 +71,7 @@ and generated audio through Riffn's worker.
 v1 is deliberately a **foreground process** — no background service is installed on your
 machine (that's a feature until you decide otherwise). Practical recipes:
 
-- **tmux / screen:** `tmux new -s riffn-bridge`, run `npx @riffn/bridge@0.6.0 start`, detach
+- **tmux / screen:** `tmux new -s riffn-bridge`, run `npx @riffn/bridge@0.6.1 start`, detach
   (`Ctrl-B D`). Survives closing the terminal window; not a reboot.
 - **Keep the machine awake:** macOS `caffeinate -s`, Windows *Settings → Power → never sleep
   when plugged in* (or `powercfg /change standby-timeout-ac 0`), Linux inhibit as you prefer.

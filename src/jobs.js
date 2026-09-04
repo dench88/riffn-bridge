@@ -16,6 +16,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { log } from "./log.js";
+import { fileAsk, fileCompleted, stripAsk } from "./inbox.js";
+import { captureProfile } from "./inbox-routing.js";
+import { classifyFailure, operatorHint, FAILURE_CODES } from "./failure-codes.js";
+import { summariseForWire } from "./ask-marker.js";
+
+/** Cap on the retained stderr tail (see the drain handler). Enough for a stack trace, never a leak. */
+const STDERR_TAIL_BYTES = 4096;
 import { snapshotRepo, snapshotRepoRing } from "./git.js";
 import {
   EDIT_JOB_ALLOWED_TOOLS, EDIT_JOB_DISALLOWED_TOOLS, READ_JOB_ALLOWED_TOOLS,
@@ -115,7 +122,9 @@ function toolCategory(name) {
   }
 }
 
-export function createJobStore(cfg, session) {
+// `pending` is the local pending-context store (inbox-pending.js). Optional: a bridge with no
+// worker token files nothing, so there is nothing to remember.
+export function createJobStore(cfg, session, pending = null) {
   const file = path.join(cfg.envDir, JOB_FILE);
   const historyFile = path.join(cfg.envDir, HISTORY_FILE);
 
@@ -170,6 +179,40 @@ export function createJobStore(cfg, session) {
     }
   }
 
+  /**
+   * The wire summary for a finished job, and the task state that must be reported with it.
+   *
+   * ⚠ Two different sources, on purpose. A job that SUCCEEDED summarises its own result, screened
+   * and bounded by summariseForWire. A job that FAILED does NOT — its summary is built from the
+   * failure code, which is this bridge's diagnosis drawn from a closed set, never the agent's text.
+   * Sending an agent's error prose to the worker would undo the whole point of failure-codes.js.
+   */
+  function outcomeSummary(job) {
+    if (job.status === "done") {
+      return { taskState: "COMPLETED", ...summariseForWire(job.result) };
+    }
+    if (job.status === "cancelled") {
+      return { taskState: "CANCELED", summary: "Task was stopped before it finished.", redacted: false };
+    }
+    const spoken = {
+      [FAILURE_CODES.SIGNED_OUT]:    "Task stopped — that machine's agent is signed out.",
+      [FAILURE_CODES.RATE_LIMITED]:  "Task stopped — the agent hit its usage limit.",
+      [FAILURE_CODES.OUT_OF_CREDIT]: "Task stopped — the agent's account is out of credit.",
+      [FAILURE_CODES.SERVICE_BUSY]:  "Task stopped — the provider was overloaded.",
+      [FAILURE_CODES.OFFLINE]:       "Task stopped — that machine couldn't reach the network.",
+      [FAILURE_CODES.LAUNCH_FAILED]: "Task stopped — the agent couldn't start on that machine.",
+      [FAILURE_CODES.TIMED_OUT]:     "Task ran past its time limit and was stopped.",
+      [FAILURE_CODES.AGENT_REFUSED]: "The agent declined that task.",
+    }[job.errorCode] ?? "Task didn't finish. Check the machine.";
+    return { taskState: "FAILED", summary: spoken, redacted: false };
+  }
+
+  /** Best-effort, detached. Never throws into the close handler. */
+  async function fileJobOutcome(job) {
+    const { taskState, summary } = outcomeSummary(job);
+    await fileCompleted(cfg, `job-${job.id}`, summary, taskState);
+  }
+
   // In-memory handle to the live child (only meaningful within THIS process). The persisted record
   // is the source of truth for status; `job` here is the SAME object the run mutates, so cancel and
   // the run's own progress/close handlers always see one state (a disk re-load in cancel() could be
@@ -208,6 +251,11 @@ export function createJobStore(cfg, session) {
       snapshotted: Boolean(job.snapshotRef),
       result: job.status === "done" ? (job.result ?? "") : null,
       error: job.status === "error" ? (job.error ?? "failed") : null,
+      // A code from the CLOSED set in failure-codes.js — this bridge's diagnosis, never the agent's
+      // words. The phone turns it into a fixed spoken line ("sign in again"), which is the only
+      // shape a pre-recorded clip can take. An older app ignores this field and keeps its generic
+      // line, so sending it cannot break anyone.
+      errorCode: job.status === "error" ? (job.errorCode ?? FAILURE_CODES.UNKNOWN) : null,
     };
   }
 
@@ -334,7 +382,25 @@ export function createJobStore(cfg, session) {
           }
           persist(job);
         } else if (evt.type === "result") {
-          if (evt.is_error) job.error = typeof evt.result === "string" ? "the agent reported an error" : "failed";
+          if (evt.is_error) {
+            // ⚠ Two audiences, and they get different amounts of detail on purpose.
+            //
+            // `job.error` goes over the wire to the phone, so it stays a fixed generic phrase:
+            // §10.10 says agent output never crosses, and an error message is agent output — it
+            // routinely carries paths, file names and command lines.
+            //
+            // `job.errorDetail` is LOCAL ONLY (the job file and this machine's terminal, the same
+            // trust boundary as the snapshot ref below). It used to be thrown away: the ternary
+            // here read the agent's own explanation and then substituted the generic phrase for
+            // it, so the one machine allowed to see why the job failed was the one place we
+            // deleted it. publicView() is an explicit allowlist, so this field cannot leak.
+            job.error = "the agent reported an error";
+            if (typeof evt.result === "string" && evt.result.trim()) {
+              job.errorDetail = evt.result.trim();
+              // Classified LOCALLY from the detail; only the resulting code crosses to the phone.
+              job.errorCode = classifyFailure(job.errorDetail);
+            }
+          }
           else finalResult = typeof evt.result === "string" ? evt.result : "";
           if (typeof evt.session_id === "string") newSessionId = evt.session_id;
         }
@@ -355,11 +421,25 @@ export function createJobStore(cfg, session) {
         }
       });
 
+      // ⚠ MUST be drained. stdio pipes stderr, and until this handler existed nothing read it: an
+      // unread pipe fills its OS buffer (~64 KB) and the child then BLOCKS FOREVER on its next
+      // write, so a chatty failure hung the job until the timeout killed it and reported the wrong
+      // cause. Draining also gives us the only explanation a non-zero exit ever produces.
+      //
+      // Bounded on purpose — a runaway agent must not be able to grow the bridge's memory. Keeping
+      // the TAIL rather than the head because the fatal message is what comes last.
+      let stderrTail = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (d) => {
+        stderrTail = (stderrTail + d).slice(-STDERR_TAIL_BYTES);
+      });
+
       child.on("error", (err) => {
         clearTimeout(timer);
         live = null;
         job.status = "error";
         job.error = `failed to launch: ${err.code || err.name}`;
+        job.errorCode = FAILURE_CODES.LAUNCH_FAILED;
         job.finishedAt = Date.now();
         persist(job);
         recordHistory(job);
@@ -380,23 +460,81 @@ export function createJobStore(cfg, session) {
         } else if (timedOut) {
           job.status = "error";
           job.error = `it ran past the ${Math.round(cfg.jobTimeoutMs / 60_000)}-minute time limit and was stopped`;
+          job.errorCode = FAILURE_CODES.TIMED_OUT;
         } else if (signal === "SIGKILL") {
           job.status = "cancelled"; // killed from outside the helper — closest honest status
         } else if (code === 0 && finalResult !== null) {
           job.status = "done";
-          job.result = finalResult;
+          // Two different obligations, deliberately not run together.
+          //
+          // Stripping the marker is a CORRECTNESS requirement and so it happens SYNCHRONOUSLY,
+          // before job.result is ever readable: the marker must never be spoken, and a job whose
+          // stored result still held it would read the protocol out loud on every replay. Doing the
+          // strip inside the filing promise left a window where a poll landing first got the raw
+          // text, and where the late assignment could land after persist() and recordHistory().
+          //
+          // Filing is BEST-EFFORT and is detached on purpose. This handler is what releases the
+          // shared single-flight (phase0_turn_contracts §3), so it must not await a network call —
+          // and an unreachable inbox must never turn a completed job into a failed one.
+          const asked = stripAsk(finalResult);
+          job.result = asked.spoken;
+          if (asked.ask) {
+            // ⚠ Captured HERE, synchronously, not inside the .then() below. "The filing-time
+            // profile" has to mean the profile as it was when the question was asked
+            // (phase0_routing_matrix.md §3.1); reading cfg after an await would quietly make it
+            // "whenever the network got back to us", which is a different and weaker claim.
+            const profile = captureProfile(cfg, { snapshotRef: job.snapshotRef ?? null });
+            // An EDIT job ran in a throwaway fresh session that is deliberately never stored, so
+            // there is no session this question belongs to — null, never the chat session, which
+            // resuming would drop the answer into the wrong conversation at the wrong permissions.
+            const sessionId = caps === "edit" ? null : (session?.get() ?? null);
+            const taskId = `job-${id}`;
+            fileAsk(cfg, asked.ask, taskId)
+              .then((itemId) => {
+                if (itemId) {
+                  pending?.remember(itemId, profile, { taskId, question: asked.ask, sessionId });
+                }
+              })
+              .catch(() => {});
+          }
         } else {
           job.status = "error";
           job.error = job.error || `agent exited with code ${code}`;
+          // A non-zero exit with no `result` event means the agent died before it could report.
+          // stderr is the only account of it that exists, so classify from there.
+          if (!job.errorCode) {
+            if (stderrTail.trim() && !job.errorDetail) job.errorDetail = stderrTail.trim();
+            job.errorCode = classifyFailure(job.errorDetail || stderrTail);
+          }
         }
         job.finishedAt = Date.now();
         persist(job);
         recordHistory(job);
         log.debug("job_end", `id=${id} status=${job.status} steps=${job.steps} caps=${job.caps} edits=${job.edits}`);
+        // File what this job DID, under the same task_id the question used, so the answer to "what
+        // did Bob build?" sits beside "what did Bob ask?" and neither needs this machine to be
+        // reachable later. Detached and best-effort: a job that produced good work must never be
+        // reported as failed because Riffn was unavailable.
+        //
+        // ⚠ A FAILED job files too, and its summary comes from the closed failure-code vocabulary
+        // rather than the agent's words. That is the 31 Aug lesson applied in the other direction:
+        // the agent's own text stays on this machine, and what crosses is this bridge's diagnosis.
+        fileJobOutcome(job).catch(() => {});
         // Operator-facing recovery pointer for edit jobs — full ref is fine on the local terminal
         // (different trust boundary than the wire). Printed at every edit-job end, not just verbose.
         if (job.caps === "edit" && job.snapshotRef) {
-          console.log(`  edit job ${job.status}: ${job.edits} file edit(s). Pre-job snapshot: ${job.snapshotRef}`);
+          // ⚠ ALWAYS print job.error on a failure. This line used to show only the status, so a
+          // failed edit job read as "edit job error: 0 file edit(s)" and the operator had to go
+          // query /v1/jobs to learn whether the agent had failed to launch, exited non-zero, or
+          // timed out. The reason was already recorded — it just never reached the one place
+          // anybody was looking (dogfood, 2026-08-31).
+          const why = job.status === "error" && job.error ? ` — ${job.error}` : "";
+          console.log(`  edit job ${job.status}${why}: ${job.edits} file edit(s). Pre-job snapshot: ${job.snapshotRef}`);
+          // The agent's own words, terminal only. This is the line that actually says what broke.
+          if (job.errorDetail) console.log(`    agent said: ${job.errorDetail}`);
+          // And what to DO about it, for the person sitting at the machine that can fix it.
+          const hint = operatorHint(job.errorCode, cfg.agent);
+          if (hint) console.log(`    ⚠ ${hint}`);
           // git diff only covers TRACKED files — a file the job CREATED is untracked and shows in
           // status, not diff (verified in first dogfood, 2026-07-12).
           console.log(`    review:  git diff ${job.snapshotRef}   (modified files)  +  git status   (created files)`);

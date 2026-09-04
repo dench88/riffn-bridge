@@ -243,6 +243,58 @@ test("authenticated HTTP health reports direct Codex as disabled", async () => {
   }
 });
 
+test("TTS pairing verification is served from the warmed cache", async () => {
+  const envDir = mkdtempSync(path.join(os.tmpdir(), "riffn-tts-cache-"));
+  const audio = Buffer.from("cached-audio");
+  const cfgValue = {
+    mode: "llm",
+    agent: "custom",
+    editMode: "disabled",
+    allowEditJobs: false,
+    host: "127.0.0.1",
+    port: 0,
+    token: "test-token",
+    cwd: path.resolve("tts-cache-fixture"),
+    envDir,
+    ttsConfigured: true,
+    ttsModel: "slow-local-tts",
+    ttsVoice: "default",
+    ttsFormat: "mp3",
+    ttsVerificationCache: {
+      input: "Riffn voice link verified.",
+      model: "slow-local-tts",
+      voice: "default",
+      format: "mp3",
+      bytes: audio,
+    },
+    modelId: "test",
+  };
+  const server = startServer(cfgValue, { quiet: true });
+  try {
+    if (!server.listening) await once(server, "listening");
+    const address = server.address();
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/audio/speech`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer test-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "slow-local-tts",
+        input: "Riffn voice link verified.",
+        voice: "default",
+        response_format: "mp3",
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "audio/mpeg");
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), audio);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(envDir, { recursive: true, force: true });
+  }
+});
+
 test("CLI health reports direct Codex as disabled without accepting a probe record", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "riffn-cli-health-"));
   const workspace = path.join(root, "workspace");

@@ -15,13 +15,26 @@ import { synthesize, mimeForFormat } from "./tts.js";
 import { createSessionStore, peekRaw as peekRawSession } from "./session.js";
 import { createJobStore, SnapshotError } from "./jobs.js";
 import { saveNote } from "./notes.js";
+import { chatTaskId, fileAsk, stripAsk } from "./inbox.js";
+import { captureProfile } from "./inbox-routing.js";
+import { createPendingStore } from "./inbox-pending.js";
+import { createReplyDispatcher } from "./inbox-dispatch.js";
+import { classifyFailure, operatorHint } from "./failure-codes.js";
+// Inbox provisioning (POST /inbox/token): the phone hands over the WORKER agent token minted at
+// pairing, and it is written beside .env at 0600 rather than into the workspace.
+import { writeEnvVar } from "./env-file.js";
+import { stateEnvPath } from "./state.js";
 
 function send(res, status, obj) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
 }
-function sendError(res, status, message) {
-  send(res, status, { error: { message, type: "riffin_bridge_error" } });
+function sendError(res, status, message, failureCode) {
+  // `code` is optional and drawn from failure-codes.js's closed set. It rides inside the existing
+  // OpenAI-shaped error envelope, so an app that doesn't know the field simply ignores it.
+  const error = { message, type: "riffin_bridge_error" };
+  if (failureCode) error.code = failureCode;
+  send(res, status, { error });
 }
 
 function authorized(req, token) {
@@ -121,11 +134,30 @@ export function startServer(cfg, { quiet = false } = {}) {
     ? createSessionStore(cfg.envDir, cfg.cwd, cfg.editMode)
     : null;
 
+  // The machine's memory of what it asked and under what authority (inbox-pending.js). Local only:
+  // the worker holds the item and the answer, never the permissions the answer will run under, and
+  // that split is what stops a compromised worker from escalating an agent.
+  const pending = createPendingStore(cfg);
+  pending.load();
+
   // Durable jobs (§13) — Claude-only (needs stream-json progress). Shares the session store so a
   // job continues the same on-machine thread as chat turns.
   const jobs = cfg.mode === "cli" && cfg.agent === "claude"
-    ? createJobStore(cfg, session)
+    ? createJobStore(cfg, session, pending)
     : null;
+
+  // The reply side of the inbox (Phase 4A). Polls the worker for answers the user spoke and puts
+  // them back into the agent that asked, under the permissions the question was FILED with.
+  //
+  // ⚠ `isBusy` is the SHARED single-flight, not a second one. A dispatch spawns the agent against
+  // the same cwd as chat and jobs, so it must queue behind them — the §11.3 collision guard.
+  const dispatcher = createReplyDispatcher(cfg, {
+    pending,
+    jobs,
+    isBusy: () => inFlight || Boolean(jobs?.isRunning()),
+    beginFlight: () => { inFlight = true; },
+    endFlight: () => { inFlight = false; },
+  });
 
   // DIAGNOSTIC: if a session file already exists in this state directory for a DIFFERENT cwd, that's
   // the signature of two bridge instances sharing an envDir and colliding over one session file —
@@ -192,6 +224,11 @@ export function startServer(cfg, { quiet = false } = {}) {
         jobs: Boolean(jobs),                               // does this bridge support §13 jobs?
         notes: true,                                       // POST /v1/notes (helper-written riffn-notes/)
         job: jobs?.current() ?? null,                      // latest job's public view (or null)
+        // Replies this bridge was mid-dispatch on when it last stopped. They are NEVER retried
+        // automatically (a stable reply id does not make a CLI idempotent), so a non-zero count is
+        // something the operator has to act on — surfacing it here is how it becomes visible from
+        // the phone at all. Count only: the ids stay on the machine.
+        strandedReplies: dispatcher.stranded().length,
         pid: process.pid,
         port: cfg.port,
       });
@@ -256,9 +293,29 @@ export function startServer(cfg, { quiet = false } = {}) {
 
         inFlight = true;
         try {
-          const text = await generateText(
+          const raw = await generateText(
             cfg, messages, body?.model, ac.signal, session, claudeSecurity
           );
+          // Same split as the job path: the strip is synchronous because the marker must never reach
+          // TTS or the SSE stream, and the filing is detached because inFlight is released below and
+          // an unreachable Riffn must never fail a turn that produced a good answer.
+          const asked = stripAsk(raw);
+          const text = asked.spoken;
+          if (asked.ask) {
+            // Captured synchronously, for the same reason as the job path: the profile the reply
+            // will be routed against must be the one in force when the question was FILED, not
+            // whenever the network call happens to resolve (phase0_routing_matrix.md §3.1).
+            const profile = captureProfile(cfg);
+            const sessionId = session?.get() ?? null;
+            const taskId = chatTaskId(sessionId);
+            fileAsk(cfg, asked.ask, taskId)
+              .then((itemId) => {
+                if (itemId) {
+                  pending.remember(itemId, profile, { taskId, question: asked.ask, sessionId });
+                }
+              })
+              .catch(() => {});
+          }
           if (codexAudit) {
             const filesChanged = codexSnapshot
               ? changedFilesSinceSnapshot(cfg.cwd, codexSnapshot.commit)
@@ -308,7 +365,16 @@ export function startServer(cfg, { quiet = false } = {}) {
             codexAudit = null;
           }
           log.error("agent_error", err);
-          if (!res.writableEnded) sendError(res, 502, `Agent error (${errorType(err)}).`);
+          // agent.js turns the agent's own failure text into this Error's MESSAGE, so errorType()
+          // — which reads err.name — reported the useless constant "Error" on every single failure.
+          // A signed-out agent and a crashed one were indistinguishable on the phone.
+          //
+          // Classify locally; send the CODE, never the message (§10.10 — the message is agent
+          // output). The generic sentence stays for old apps that don't read the code.
+          const failure = classifyFailure(err?.message);
+          const hint = operatorHint(failure, cfg.agent);
+          if (hint) console.log(`  chat turn failed — ⚠ ${hint}`);
+          if (!res.writableEnded) sendError(res, 502, "The agent couldn't complete that turn.", failure);
         } finally {
           inFlight = false;
         }
@@ -385,6 +451,51 @@ export function startServer(cfg, { quiet = false } = {}) {
       return sendError(res, 404, `Not found: ${req.method} ${path}`);
     }
 
+    // ── Inbox provisioning: POST /inbox/token { token } → 204 ─────────────────────────────────
+    // The phone mints a WORKER agent token at pairing and hands it over here, on the connection
+    // pairing just authenticated (agent_inbox_plan.md §7.5, option A). That is what makes "link a
+    // machine and it can reach you" true without a separate setup step — the manual paste path is
+    // the fallback for cloud agents with no pairing flow, not the front door.
+    //
+    // ⚠ Two credentials, opposite directions, and conflating them is the documented source of
+    // confusion: the PAIRING token (already checked above) lets the phone call this machine; the
+    // WORKER token being delivered here lets this machine identify itself to Riffn when filing an
+    // item or collecting a reply. This route is authorised by the first and stores the second.
+    //
+    // Written to the private state directory beside .env, at 0600, and stripped from every child
+    // environment by childEnv() along with the rest of RIFFIN_BRIDGE_* — an agent must never see
+    // the credential that speaks for it.
+    if (req.method === "POST" && path === "/inbox/token") {
+      return readJsonBody(req, res, (body) => {
+        const token = typeof body?.token === "string" ? body.token.trim() : "";
+        if (!token.startsWith("rif_")) {
+          return sendError(res, 400, "`token` must be a Riffn worker agent token.");
+        }
+        try {
+          writeEnvVar(stateEnvPath(cfg.cwd), "RIFFIN_BRIDGE_INBOX_TOKEN", token);
+          // ⚠ ACTIVATE IT IN THIS PROCESS, not just on disk. `cfg.inboxToken` is read once at
+          // startup (config.js), and the dispatcher idles itself when it finds no token there —
+          // so writing the file alone left a freshly paired machine unable to file OR collect
+          // until someone restarted it, with nothing anywhere saying so. Pairing is the moment
+          // the user expects the machine to come alive; a restart requirement they were never
+          // told about is indistinguishable from the feature being broken.
+          cfg.inboxToken = token;
+          // stop() first so a second delivery cannot leave two polling intervals running.
+          // start() re-reads the journal and re-runs the boot reconcile, both of which are
+          // safe here: reconcileOnBoot returns immediately when nothing is in flight.
+          dispatcher.stop();
+          dispatcher.start();
+          // Never log the token, not even truncated: this file is the one place it exists.
+          log.debug("inbox_token_stored", "worker agent token saved and dispatcher armed");
+          res.writeHead(204);
+          return res.end();
+        } catch (err) {
+          log.error("inbox_token_store_failed", err);
+          return sendError(res, 500, "Couldn't save the token on this machine.");
+        }
+      });
+    }
+
     // ── Voice notes: POST /v1/notes { text } → 201 { note: { file } } ──────────────────────────
     // The helper writes riffn-notes/<date>-<slug>.md under cwd itself (notes.js) — no agent
     // involvement, caps stay read-plan, and no single-flight gate needed (it's just a file write,
@@ -411,10 +522,18 @@ export function startServer(cfg, { quiet = false } = {}) {
         if (!input.trim()) return sendError(res, 400, "`input` (text to speak) is required.");
         const voice = body?.voice || cfg.ttsVoice;
         const format = body?.response_format || cfg.ttsFormat;
+        const model = body?.model || cfg.ttsModel;
         const ac = new AbortController();
         res.on("close", () => { if (!res.writableFinished) ac.abort(); });
         try {
-          const bytes = await synthesize(cfg, input, voice, format, ac.signal);
+          const cached = cfg.ttsVerificationCache;
+          const bytes = cached
+            && input === cached.input
+            && model === cached.model
+            && voice === cached.voice
+            && format === cached.format
+            ? cached.bytes
+            : await synthesize(cfg, input, voice, format, ac.signal);
           if (!res.writableEnded) { res.writeHead(200, { "Content-Type": mimeForFormat(format) }); res.end(bytes); }
         } catch (err) {
           log.error("tts_error", err);
@@ -498,5 +617,10 @@ export function startServer(cfg, { quiet = false } = {}) {
     console.log(`  tts:  ${cfg.ttsConfigured ? "configured" : "not configured — text only"}`);
     console.log(`  Model URL for Riffn:  http://${cfg.host}:${cfg.port}/v1`);
   });
+
+  // Started once the socket is up, so a bridge that cannot bind never quietly consumes a reply and
+  // acks it from a process that is about to exit.
+  server.on("listening", () => dispatcher.start());
+  server.on("close", () => dispatcher.stop());
   return server;
 }

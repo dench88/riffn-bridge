@@ -127,6 +127,15 @@ export function readConfig({ codexPolicyMode = "enforce" } = {}) {
     customAgentArgs: (process.env.RIFFIN_BRIDGE_AGENT_ARGS || "").trim(),
     modelId: process.env.RIFFIN_BRIDGE_MODEL || "riffn-bridge",
 
+    // Agent inbox. The WORKER agent token, delivered by the phone at pairing (POST /inbox/token)
+    // and stored beside .env. Absent means this machine simply cannot file items — which is the
+    // ordinary state for a machine paired before provisioning existed, and must never be an error.
+    //
+    // ⚠ Two credentials, opposite directions: RIFFIN_BRIDGE_TOKEN lets the PHONE call this machine,
+    // this one lets THIS MACHINE identify itself to Riffn. Never interchange them.
+    inboxToken: process.env.RIFFIN_BRIDGE_INBOX_TOKEN || "",
+    inboxURL: process.env.RIFFIN_BRIDGE_INBOX_URL || "https://riffin-api.rselvey.workers.dev",
+
     // TTS (optional; Mode B). Text-only if neither is set.
     ttsUrl,
     ttsKey: process.env.RIFFIN_BRIDGE_TTS_KEY || "",
