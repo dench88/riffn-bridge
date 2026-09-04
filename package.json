@@ -1,6 +1,6 @@
 {
   "name": "@riffn/bridge",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Voice-drive your own Claude Code or configured custom agent from Riffn over Tailscale. Zero runtime dependencies.",
   "type": "module",
   "bin": {

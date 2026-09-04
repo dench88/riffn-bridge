@@ -275,20 +275,28 @@ export function createReplyDispatcher(cfg, {
     // question, possibly while driving — which is exactly why it is not satisfied by the user having
     // answered at all.
     //
-    // The bridge cannot obtain it. It has no voice, and the reply arrives carrying only the user's
-    // text — there is no field on the wire that says a human confirmed. So rather than assume one
-    // (which would write files on the strength of a half-remembered "yeah, sure") this fails closed
-    // and hands the answer back with the reason. The user's text is preserved on the worker, so they
-    // can send it again rather than re-speak it.
+    // The phone now proves it: `confirmed` rides on the reply, set only when the user gave a fresh
+    // yes at the moment of answering (worker migration 0039). So the gate became a CHECK rather
+    // than a blanket refusal — but every part of the old reasoning still holds for a reply that
+    // arrives without one, and that is still the common case for any client that predates this.
     //
-    // ⚠ When the phone can prove the confirmation, THIS is the block that goes — not the matrix.
-    // Keeping the rule in routeReply() truthful is what makes that a deletion rather than a rewrite.
-    if (decision.requiresVoiceConfirm) {
+    // ⚠ THE DIRECTION OF TRUST. `requiresVoiceConfirm` comes from THIS machine's own filing-time
+    // record; `confirmed` comes over the wire. The local record decides whether permission was
+    // needed, the wire only reports whether a human gave it. A worker that lied about `confirmed`
+    // could not widen what this reply is allowed to do — routeReply already fixed that from local
+    // state — it could only skip a prompt the user would otherwise have seen. Never invert these.
+    if (decision.requiresVoiceConfirm && reply.confirmed !== true) {
       log.debug("reply_needs_confirmation", `reply=${reply.reply_id} mode=${entry.profile?.editMode}`);
       await ackReply(cfg, reply.reply_id, "needs_confirmation");
-      // Deliberately NOT forgotten: the question is still open and the user may answer it again once
-      // confirmation exists. Forgetting would turn the retry into `unknown_item`.
+      // Deliberately NOT forgotten: the question is still open and the user may answer it again with
+      // a confirmation. Forgetting would turn the retry into `unknown_item`.
       return;
+    }
+    if (decision.requiresVoiceConfirm) {
+      // Worth its own line in the log: this is the one path where a spoken yes, made on another
+      // device, is what authorised a write on this machine. If a file changes unexpectedly, this
+      // is the record that says why.
+      log.debug("reply_confirmed", `reply=${reply.reply_id} mode=${entry.profile?.editMode}`);
     }
 
     // ⚠ Persist BEFORE dispatch, always (plan §5). The window this closes is the helper dying

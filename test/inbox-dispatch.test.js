@@ -109,7 +109,7 @@ function scenario(t, { agent = "claude", editMode = "disabled", jobs = fakeJobs(
   return { cfg, pending, jobs, worker: w, dispatcher, envDir };
 }
 
-// ── 1. THE RULE: limited never resumes, and today never writes ───────────────────────────────
+// ── 1. THE RULE: limited never resumes, and never writes without a confirmation ───────────────
 
 test("limited: the reply is refused for want of a confirmation, and NOTHING is spawned", async (t) => {
   const s = scenario(t, { editMode: "limited" });
@@ -126,6 +126,50 @@ test("limited: the pending context SURVIVES the refusal, so the user can answer 
   await s.dispatcher.tick();
   // Forgetting here would turn the retry into `unknown_item` — a worse and less honest message.
   assert.ok(s.pending.get("itm_1"), "the question is still open");
+});
+
+test("limited: a CONFIRMED reply is dispatched as an edit job", async (t) => {
+  const s = scenario(t, {
+    editMode: "limited",
+    worker: fakeWorker({ replies: [{ ...REPLY, confirmed: true }] }),
+  });
+  await s.dispatcher.tick();
+
+  assert.equal(s.jobs.calls.length, 1, "a confirmed limited reply must reach the agent");
+  assert.equal(s.jobs.calls[0].caps, "edit", "and it must run as an EDIT job, not read-only");
+  assert.deepEqual(s.worker.acks(), [
+    { replyId: "rep_1", outcome: "delivered", reason: null },
+  ]);
+});
+
+test("limited: only a literal true confirms — a truthy value is not a confirmation", async (t) => {
+  // ⚠ The one field standing between a spoken word and a file write. Anything other than the
+  // boolean true (a string, a 1, a null) means the client did not prove a confirmation happened,
+  // and guessing in the permissive direction here writes files nobody agreed to.
+  for (const value of ["true", 1, {}, null, undefined]) {
+    const s = scenario(t, {
+      editMode: "limited",
+      worker: fakeWorker({ replies: [{ ...REPLY, confirmed: value }] }),
+    });
+    await s.dispatcher.tick();
+    assert.deepEqual(s.jobs.calls, [], `confirmed: ${JSON.stringify(value)} must not dispatch`);
+    assert.deepEqual(s.worker.acks(), [
+      { replyId: "rep_1", outcome: "refused", reason: "needs_confirmation" },
+    ]);
+  }
+});
+
+test("disabled: a confirmation flag does not widen what a read-only machine does", async (t) => {
+  // The machine's own filing-time record decides what a reply may do. A worker that set this
+  // field on every reply must not be able to turn a read-only resume into anything else.
+  const s = scenario(t, {
+    editMode: "disabled",
+    worker: fakeWorker({ replies: [{ ...REPLY, confirmed: true }] }),
+  });
+  await s.dispatcher.tick();
+
+  assert.ok(s.jobs.calls.every(c => c.caps !== "edit"),
+            "confirmed must never grant edit rights the mode does not have");
 });
 
 test("limited: the session id is never even STORED, so resuming is unavailable", (t) => {
