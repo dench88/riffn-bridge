@@ -13,6 +13,46 @@
 // is detectable rather than silently mis-parsed by an old bridge.
 const MARKER = /^RIFFN_ASK\/1:[ \t]*(.*)$/;
 
+/**
+ * What the agent is told about the marker. Lives beside the parser ON PURPOSE — an instruction that
+ * drifts from the regex is worse than none, because it produces confident output nothing consumes.
+ *
+ * ⚠ THIS MUST ARRIVE AS A SYSTEM DIRECTIVE, never as conversation text. Told in a user turn, a
+ * well-behaved agent correctly refuses it as injected control text — observed on a real machine,
+ * 4 Sep 2026. That refusal is the agent working properly, and it is why §10's "best-effort" was
+ * never reachable before: nothing had ever put the convention where the agent could trust it.
+ *
+ * ⚠ And it belongs ONLY where the user is genuinely absent. Today that is exactly one place: the
+ * inbox REPLY DISPATCH (inbox-dispatch.js). Not on a chat turn, where the user is listening and
+ * hears the question — answering aloud does not resolve a filed item, so it would sit PENDING and
+ * be raised again later by voice triage, asking something already settled.
+ *
+ * ⚠ And NOT in jobs.start either, however tempting: `/v1/jobs` carries ordinary spoken turns as
+ * well as background tasks (the app's runBridgeJobTurn, style `.chatTurn`), and the two differ
+ * only in system-prompt wording the bridge never inspects. A first pass put it there on the
+ * assumption that a job meant background work; it does not.
+ *
+ * The app knows the difference and composes its own system prompt per style, so teaching the
+ * marker for real background tasks belongs THERE, not here.
+ *
+ * The last line is the load-bearing one. The inbox is a human-attention queue, and an agent that
+ * asks whenever it could ask is worse for the user than one that never asks at all.
+ */
+export const ASK_MARKER_INSTRUCTION = [
+  "If you cannot finish without a decision from the person who started this, end your FINAL",
+  "message with a single line that begins at the start of the line:",
+  "",
+  "RIFFN_ASK/1: <your question>",
+  "",
+  "Exactly one such line, the whole question on it, in plain prose. It is delivered to the user's",
+  "phone and read aloud, so use no file paths, code, or secrets — say what you need in words.",
+  "The line is stripped from your reply before it is spoken.",
+  "",
+  "Only when you are genuinely blocked. If you can proceed on a reasonable assumption, do that and",
+  "say what you assumed instead.",
+].join("\n");
+
+
 // Matches `summary`'s byte cap in phase0_schemas.md §2.3 — roughly one spoken breath. A marker over
 // the limit is REFUSED, never truncated: a half-sentence question is worse than no question, and
 // silent truncation is the failure class recorded against Paseo in competitors.md §9.

@@ -25,6 +25,7 @@ import { routeReply } from "./inbox-routing.js";
 import { leaseReplies, ackReply, leaseCancellations, ackCancellation } from "./inbox.js";
 import { generateText } from "./agent.js";
 import { SnapshotError } from "./jobs.js";
+import { ASK_MARKER_INSTRUCTION } from "./ask-marker.js";
 
 /**
  * The durable dispatch journal (phase0_turn_contracts §3.2 / §4: `dispatching` is a durable state,
@@ -231,7 +232,11 @@ export function createReplyDispatcher(cfg, {
       throw new Error("refusing to dispatch: a limited-mode reply must never resume a session");
     }
 
-    const view = jobs.start(prompt, undefined, caps);
+    // ⚠ The one dispatch that is unambiguously BACKGROUND, so it is the one that teaches the ask
+    // marker. The user answered an inbox item and has moved on; if the agent needs something else
+    // to finish, the inbox is the only way back to them. Contrast /v1/jobs, which also carries
+    // ordinary spoken turns the user is sitting and listening to (see jobs.js).
+    const view = jobs.start(prompt, ASK_MARKER_INSTRUCTION, caps);
     // null means the single-flight beat us between the isBusy() check and here. Nothing started.
     if (!view) throw new SnapshotError("the agent was busy when the reply was dispatched");
     return `job ${view.id}`;

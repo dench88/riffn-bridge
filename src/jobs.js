@@ -336,6 +336,13 @@ export function createJobStore(cfg, session, pending = null) {
       };
       persist(job);
 
+      // ⚠ The ask-marker instruction is deliberately NOT added here, and the reason is worth
+      // keeping: a job is not necessarily background work. The app dispatches ORDINARY spoken
+      // turns through /v1/jobs on a jobs-capable machine (runBridgeJobTurn, style .chatTurn) —
+      // only the system prompt's wording distinguishes those from a real task, and that never
+      // reaches this function. Injecting here would put the marker on live conversation, where
+      // the user hears the question, answers aloud, and the filed item stays PENDING for voice
+      // triage to raise again later. Callers that KNOW they are background add it themselves.
       const args = buildJobArgs(prompt, appendSystemPrompt, caps, existingSession, securityConfigs);
 
       log.debug("job_start", `id=${id} cwd=${cfg.cwd} caps=${job.caps} resume=${existingSession || "none"}`);

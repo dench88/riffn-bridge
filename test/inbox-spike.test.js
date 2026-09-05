@@ -14,6 +14,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { parseAsk, createAdherenceCounter, GENERIC_ASK, MAX_ASK_BYTES } from "../src/ask-marker.js";
 import { captureProfile, profileMatches, routeReply } from "../src/inbox-routing.js";
@@ -208,4 +209,46 @@ test("round trip: ask → file → answer → dispatch, under every permission m
       assert.equal(typeof decision.requiresVoiceConfirm, "boolean");
     }
   }
+});
+
+// ── 6. The instruction and the parser must not drift ──────────────────────────────────────────
+//
+// ⚠ The marker was unreachable in practice until 4 Sep 2026: nothing ever told an agent the
+// convention existed, and telling it in a USER turn is correctly refused as injected control text.
+// It now arrives as a system directive on background work (jobs.js). That makes the wording load
+// bearing — an instruction whose example does not satisfy the real regex would produce confident
+// output that nothing consumes, which is worse than staying silent.
+
+test("the example line in ASK_MARKER_INSTRUCTION actually parses", async () => {
+  const { ASK_MARKER_INSTRUCTION } = await import("../src/ask-marker.js");
+
+  // Pull the literal example out of the instruction rather than restating it here — restating it
+  // is precisely the drift this test exists to catch.
+  const example = ASK_MARKER_INSTRUCTION
+    .split("\n")
+    .find((l) => l.startsWith("RIFFN_ASK/1:"));
+  assert.ok(example, "the instruction must contain a line-start example");
+
+  const parsed = parseAsk(`Here is what I did.\n${example.replace("<your question>", "Which database?")}`);
+  assert.equal(parsed.found, true, "the shape we tell agents to emit must be the shape we parse");
+  assert.equal(parsed.ask, "Which database?");
+  assert.equal(parsed.spoken, "Here is what I did.", "the marker line is never spoken");
+});
+
+test("a reply dispatch teaches the marker; an ordinary job does not", async () => {
+  // ⚠ The scoping that matters. /v1/jobs carries ordinary spoken turns as well as background
+  // tasks, so the instruction must NOT ride on every job — only on the inbox reply dispatch,
+  // where the user has demonstrably gone away. A first pass had this backwards.
+  const jobsSrc = readFileSync(new URL("../src/jobs.js", import.meta.url), "utf8");
+  const dispatchSrc = readFileSync(new URL("../src/inbox-dispatch.js", import.meta.url), "utf8");
+
+  assert.ok(
+    !jobsSrc.includes("ASK_MARKER_INSTRUCTION"),
+    "jobs.start must not inject the marker — it also serves live conversational turns",
+  );
+  assert.match(
+    dispatchSrc,
+    /jobs\.start\(prompt, ASK_MARKER_INSTRUCTION, caps\)/,
+    "the reply dispatch is the one path that should teach it",
+  );
 });
