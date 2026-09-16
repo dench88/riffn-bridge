@@ -7,7 +7,7 @@ import { MAX_BODY_BYTES, VERSION, codexPolicyHealth, redactedCwd } from "./confi
 import { log, errorType, warnVerboseIfEnabled } from "./log.js";
 import {
   generateText, agentCaps, agentCapabilities, customAgentCapsWarning, effectiveCaps,
-  extractSystemPrompt, agentCommand, buildPrompt,
+  extractSystemPrompt, agentCommand, buildPrompt, childEnv,
 } from "./agent.js";
 import { changedFilesSinceSnapshot, snapshotRepoRing, SNAPSHOT_RING_SIZE } from "./git.js";
 import { beginCodexTurn, finishCodexTurn } from "./audit.js";
@@ -575,6 +575,20 @@ export function startServer(cfg, { quiet = false } = {}) {
     console.log(`  note: this bridge executes an agent on YOUR machine; you control its permissions — run at your own risk.`);
     const capsWarning = customAgentCapsWarning(cfg);
     if (capsWarning) console.warn(capsWarning);
+    // Say which credentials this shell was carrying that the agent will NOT see. Named, never
+    // valued. An operator who deliberately exported one of these needs to know it was withheld —
+    // otherwise the agent fails at something unrelated and nothing points here. It is also the
+    // moment to notice a token you did not mean to have in this window at all.
+    const { withheld } = childEnv();
+    const notOurs = withheld.filter((k) => !k.startsWith("RIFFIN_BRIDGE_"));
+    if (notOurs.length > 0) {
+      console.log(
+        `  withheld from the agent (${notOurs.length}): ${notOurs.join(", ")}\n` +
+        `    Credentials in this shell are not passed to the spawned agent. If one of these is\n` +
+        `    something the agent genuinely needs, start the bridge from a shell without it and\n` +
+        `    give the agent its own credential instead.`
+      );
+    }
     if (caps === "read-plan+edit-jobs") {
       console.warn(
         `⚠️  Edit tasks ENABLED (RIFFIN_BRIDGE_ALLOW_EDIT_JOBS=1): a voice-confirmed task from a\n` +

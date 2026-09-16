@@ -493,9 +493,45 @@ test("ungated bridge: plain job dispatch is write-capable + snapshotted; /health
 
 // Bridge secrets must never reach a spawned agent (review finding #2): the pairing token and any
 // provider keys are RIFFIN_BRIDGE_-prefixed, and Codex runs a sandboxed shell even at read-only.
-test("childEnv strips every RIFFIN_BRIDGE_* var and keeps everything else", () => {
-  const env = childEnv({ PATH: "/bin", HOME: "/h", RIFFIN_BRIDGE_TOKEN: "secret", RIFFIN_BRIDGE_TTS_KEY: "k" });
+test("childEnv strips every RIFFIN_BRIDGE_* var and keeps ordinary ones", () => {
+  const { env, withheld } = childEnv({
+    PATH: "/bin", HOME: "/h", RIFFIN_BRIDGE_TOKEN: "secret", RIFFIN_BRIDGE_TTS_KEY: "k",
+  });
   assert.deepEqual(env, { PATH: "/bin", HOME: "/h" });
+  assert.deepEqual(withheld, ["RIFFIN_BRIDGE_TOKEN", "RIFFIN_BRIDGE_TTS_KEY"]);
+});
+
+// ⚠ The operator's OWN credentials, not ours. A developer who sourced a deploy token in the shell
+// they then started the bridge from would otherwise hand it to Claude Code on every turn — no file
+// read required, and nothing anywhere would say so. The rule was always "an agent must never see
+// the credential that speaks for it"; applying it only to RIFFIN_BRIDGE_* was arbitrary.
+test("childEnv withholds third-party credentials found in the operator's shell", () => {
+  const { env, withheld } = childEnv({
+    PATH: "/bin",
+    CLOUDFLARE_API_TOKEN: "cf",
+    AWS_SECRET_ACCESS_KEY: "aws",
+    GITHUB_TOKEN: "gh",
+    NPM_TOKEN: "npm",
+    SOME_SERVICE_PASSWORD: "p",
+    EDITOR: "vim",
+  });
+  assert.deepEqual(env, { PATH: "/bin", EDITOR: "vim" });
+  assert.deepEqual(withheld, [
+    "AWS_SECRET_ACCESS_KEY", "CLOUDFLARE_API_TOKEN", "GITHUB_TOKEN",
+    "NPM_TOKEN", "SOME_SERVICE_PASSWORD",
+  ]);
+});
+
+// ⚠ The exception that keeps the bridge working at all. Claude Code may be authenticated by
+// ANTHROPIC_API_KEY; stripping it would not harden anything, it would break every turn while
+// looking like an unrelated agent failure.
+test("childEnv never withholds the agent's own authentication", () => {
+  const { env, withheld } = childEnv({
+    ANTHROPIC_API_KEY: "sk-ant", CLAUDE_CODE_SOMETHING: "x", CLOUDFLARE_API_TOKEN: "cf",
+  });
+  assert.equal(env.ANTHROPIC_API_KEY, "sk-ant");
+  assert.equal(env.CLAUDE_CODE_SOMETHING, "x");
+  assert.deepEqual(withheld, ["CLOUDFLARE_API_TOKEN"]);
 });
 
 // Agent-bound arming (review finding #7): the EDIT_MODE_AGENT stamp written by init degrades a

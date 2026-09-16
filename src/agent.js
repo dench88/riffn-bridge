@@ -266,17 +266,47 @@ export function agentCapabilities(cfg) {
   };
 }
 
-// Environment for a spawned agent, with every RIFFIN_BRIDGE_* var stripped (review finding #2):
-// the child never needs the bridge's own secrets, and for an agent with any shell surface (Codex —
-// sandboxed shell runs even read-only) an inherited env would hand the pairing bearer token and
-// TTS/LLM provider keys to model-run commands. Applied to ALL agents, Claude included — its
-// denied-Bash posture should not be the only thing between a prompt and the token.
+// Credentials that are NOT the bridge's but are commonly exported into a developer's shell. An
+// agent spawned from that shell inherits them, which means a cloud model's context can end up
+// holding your Cloudflare, AWS or npm credentials without anything having read a file.
+//
+// ⚠ The rule this generalises was already here for RIFFIN_BRIDGE_*: "an agent must never see the
+// credential that speaks for it." It was applied only to OUR secrets, which was arbitrary — the
+// agent has no more business with your deploy token than with the pairing token, and the operator
+// most likely to be caught is the one who sourced a token in the window they then started the
+// bridge from. Depending on people never doing that is not a control.
+const CREDENTIAL_SUFFIX = /(_TOKEN|_KEY|_SECRET|_PASSWORD|_PASSWD|_CREDENTIALS)$/i;
+const CREDENTIAL_PREFIX = /^(AWS_|CLOUDFLARE_|CF_API|GITHUB_|GH_|NPM_|DOCKER_|STRIPE_|SENTRY_|VERCEL_|SUPABASE_|OPENAI_|GROQ_|ELEVENLABS_|DEEPGRAM_|TOGETHER_)/i;
+
+// ⚠ Never stripped: the agent's OWN authentication. Removing these does not harden anything, it
+// just stops the agent running at all — Claude Code may be authenticated by ANTHROPIC_API_KEY, and
+// a bridge that silently broke every turn to protect a credential the child legitimately needs
+// would be a worse failure than the one being prevented.
+const AGENT_OWN_AUTH = /^(ANTHROPIC_|CLAUDE_)/i;
+
+export function isWithheldFromAgent(key) {
+  if (key.startsWith("RIFFIN_BRIDGE_")) return true;
+  if (AGENT_OWN_AUTH.test(key)) return false;
+  return CREDENTIAL_SUFFIX.test(key) || CREDENTIAL_PREFIX.test(key);
+}
+
+// Environment for a spawned agent (review finding #2): the child never needs the bridge's own
+// secrets, and for an agent with any shell surface (Codex — sandboxed shell runs even read-only) an
+// inherited env would hand the pairing bearer token and TTS/LLM provider keys to model-run
+// commands. Applied to ALL agents, Claude included — its denied-Bash posture should not be the only
+// thing between a prompt and the token.
+//
+// Returns the environment plus the SORTED NAMES of what was withheld, so startup can say so out
+// loud. Silently removing a variable an operator deliberately exported is its own bug class: the
+// agent fails at something unrelated and nothing points at the cause. Names only — never values.
 export function childEnv(env = process.env) {
   const out = {};
+  const withheld = [];
   for (const [key, value] of Object.entries(env)) {
-    if (!key.startsWith("RIFFIN_BRIDGE_")) out[key] = value;
+    if (isWithheldFromAgent(key)) withheld.push(key);
+    else out[key] = value;
   }
-  return out;
+  return { env: out, withheld: withheld.sort() };
 }
 
 export function customAgentCapsWarning(cfg) {
@@ -322,7 +352,7 @@ function runAgent(cfg, prompt, signal, sessionId, appendSystemPrompt, security =
     // Codex's `exec`) block waiting for data/EOF that never arrives, until this process's own
     // timeout kills it. No agent here needs stdin, so closing it outright is correct for all of them.
     const child = spawn(resolvedBin, [...prefixArgs, ...args], {
-      cwd: cfg.cwd, env: childEnv(), stdio: ["ignore", "pipe", "pipe"]
+      cwd: cfg.cwd, env: childEnv().env, stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "", stderr = "", settled = false;
 

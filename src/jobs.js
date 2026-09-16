@@ -353,7 +353,7 @@ export function createJobStore(cfg, session, pending = null) {
       // stdin (Node's spawn default) risks a hang some agent CLIs won't recover from on their own.
       // childEnv: bridge secrets (RIFFIN_BRIDGE_*) never reach the agent process (review finding #2).
       const child = spawn(resolvedClaudeBin, [...prefixArgs, ...args], {
-        cwd: cfg.cwd, env: childEnv(), stdio: ["ignore", "pipe", "pipe"]
+        cwd: cfg.cwd, env: childEnv().env, stdio: ["ignore", "pipe", "pipe"]
       });
       live = { id, child, job };
 
