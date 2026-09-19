@@ -213,6 +213,10 @@ export function createJobStore(cfg, session, pending = null) {
     await fileCompleted(cfg, `job-${job.id}`, summary, taskState);
   }
 
+  // Ask filings in flight, by job id — each resolves to the worker item id or null. Only meaningful
+  // within THIS process; after a restart heard() falls back to the persisted askItemId.
+  const askFilings = new Map();
+
   // In-memory handle to the live child (only meaningful within THIS process). The persisted record
   // is the source of truth for status; `job` here is the SAME object the run mutates, so cancel and
   // the run's own progress/close handlers always see one state (a disk re-load in cancel() could be
@@ -256,6 +260,10 @@ export function createJobStore(cfg, session, pending = null) {
       // shape a pre-recorded clip can take. An older app ignores this field and keeps its generic
       // line, so sending it cannot break anyone.
       errorCode: job.status === "error" ? (job.errorCode ?? FAILURE_CODES.UNKNOWN) : null,
+      // True when the final message carried a RIFFN_ASK marker, i.e. a question was (or is being)
+      // filed to the inbox. The app uses it to decide whether an INLINE answer needs POST
+      // /v1/jobs/heard — see heard() below. Older apps ignore the field.
+      asked: Boolean(job.asked),
     };
   }
 
@@ -485,6 +493,7 @@ export function createJobStore(cfg, session, pending = null) {
           // and an unreachable inbox must never turn a completed job into a failed one.
           const asked = stripAsk(finalResult);
           job.result = asked.spoken;
+          job.asked = Boolean(asked.ask);
           if (asked.ask) {
             // ⚠ Captured HERE, synchronously, not inside the .then() below. "The filing-time
             // profile" has to mean the profile as it was when the question was asked
@@ -496,13 +505,18 @@ export function createJobStore(cfg, session, pending = null) {
             // resuming would drop the answer into the wrong conversation at the wrong permissions.
             const sessionId = caps === "edit" ? null : (session?.get() ?? null);
             const taskId = `job-${id}`;
-            fileAsk(cfg, asked.ask, taskId)
+            // Kept so heard() can wait for the filing to land before it reports the task terminal.
+            // Without that ordering the report can overtake the filing and bury the question.
+            askFilings.set(id, fileAsk(cfg, asked.ask, taskId)
               .then((itemId) => {
                 if (itemId) {
+                  job.askItemId = itemId; // local only; publicView() never carries it
+                  persist(job);
                   pending?.remember(itemId, profile, { taskId, question: asked.ask, sessionId });
                 }
+                return itemId;
               })
-              .catch(() => {});
+              .catch(() => null));
           }
         } else {
           job.status = "error";
@@ -526,7 +540,13 @@ export function createJobStore(cfg, session, pending = null) {
         // ⚠ A FAILED job files too, and its summary comes from the closed failure-code vocabulary
         // rather than the agent's words. That is the 31 Aug lesson applied in the other direction:
         // the agent's own text stays on this machine, and what crosses is this bridge's diagnosis.
-        fileJobOutcome(job).catch(() => {});
+        //
+        // ⚠ NOT for a job that ASKED. Its task is INPUT_REQUIRED, and the worker mirrors a reported
+        // task state onto the task's open items — so reporting COMPLETED here raced the ask filing
+        // above, and whenever the report landed second the question left the inbox the moment it
+        // was filed (found 19 Sep 2026, first real device test). The outcome is filed later: by
+        // heard() if the user answered inline, or by the reply dispatch's own job otherwise.
+        if (!job.asked) fileJobOutcome(job).catch(() => {});
         // Operator-facing recovery pointer for edit jobs — full ref is fine on the local terminal
         // (different trust boundary than the wire). Printed at every edit-job end, not just verbose.
         if (job.caps === "edit" && job.snapshotRef) {
@@ -549,6 +569,28 @@ export function createJobStore(cfg, session, pending = null) {
         }
       });
 
+      return publicView(job);
+    },
+
+    // The user HEARD the latest job's question and is answering it in conversation — the app calls
+    // this only for an inline-spoken result whose view says `asked`. The filed item is now moot:
+    // forget its pending context so a late inbox reply cannot re-run the question, then file the
+    // outcome exactly as an un-asked job does at close (which reports the task terminal and takes
+    // the item out of the user's view). Returns the public view, or null if there is no job.
+    // Idempotent: a repeat call files nothing twice.
+    //
+    // ⚠ Awaits the ask filing FIRST. The terminal report must land after the item exists — the
+    // same race the close handler had to stop running, now resolved by ordering instead.
+    async heard() {
+      const job = load();
+      if (!job) return null;
+      if (!job.asked || job.heard || job.status !== "done") return publicView(job);
+      const itemId = askFilings.has(job.id) ? await askFilings.get(job.id) : (job.askItemId ?? null);
+      askFilings.delete(job.id);
+      if (itemId) pending?.forget(itemId);
+      job.heard = true;
+      persist(job);
+      await fileJobOutcome(job);
       return publicView(job);
     },
 

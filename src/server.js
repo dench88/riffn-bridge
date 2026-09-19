@@ -386,6 +386,8 @@ export function startServer(cfg, { quiet = false } = {}) {
     // POST /v1/jobs        { messages } → start a job, return its id + status immediately
     // GET  /v1/jobs        → the current/latest job's status (+ result when done)
     // POST /v1/jobs/cancel → stop the running job
+    // POST /v1/jobs/heard  → the latest job's question was spoken to the user inline; retire its
+    //                        inbox item (jobs.js heard()). Only meaningful when the view says `asked`.
     if (path.startsWith("/v1/jobs")) {
       // Distinct from the plain 404 an OLD bridge (predating /v1/jobs) returns: this bridge is
       // current but its agent can't run jobs (they need Claude's stream-json progress). The app
@@ -404,6 +406,13 @@ export function startServer(cfg, { quiet = false } = {}) {
       if (req.method === "POST" && path === "/v1/jobs/cancel") {
         const view = jobs.cancel();
         return view ? send(res, 200, { job: view }) : send(res, 409, { error: { message: "No job is running.", type: "riffin_bridge_error" } });
+      }
+      if (req.method === "POST" && path === "/v1/jobs/heard") {
+        // Best-effort on the wire too: the app fires this after speaking and never waits on it, so
+        // a worker hiccup here is logged, not surfaced.
+        return jobs.heard()
+          .then((view) => view ? send(res, 200, { job: view }) : sendError(res, 404, "No job to mark as heard."))
+          .catch((err) => { log.error("job_heard_failed", err); sendError(res, 500, "Couldn't retire the job's question."); });
       }
       if (req.method === "POST" && path === "/v1/jobs") {
         if (jobs.isRunning()) {

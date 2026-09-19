@@ -36,7 +36,7 @@ This is the **Phase 1.5 minimal cut** of the bridge plan: link + trust, delibera
 In the repo (working directory) you want to talk to:
 
 ```bash
-npx @riffn/bridge@0.6.4 init
+npx @riffn/bridge@0.6.5 init
 ```
 
 **Pin the version** (as above) rather than running a floating `npx @riffn/bridge` — you're
@@ -71,7 +71,7 @@ and generated audio through Riffn's worker.
 v1 is deliberately a **foreground process** — no background service is installed on your
 machine (that's a feature until you decide otherwise). Practical recipes:
 
-- **tmux / screen:** `tmux new -s riffn-bridge`, run `npx @riffn/bridge@0.6.4 start`, detach
+- **tmux / screen:** `tmux new -s riffn-bridge`, run `npx @riffn/bridge@0.6.5 start`, detach
   (`Ctrl-B D`). Survives closing the terminal window; not a reboot.
 - **Keep the machine awake:** macOS `caffeinate -s`, Windows *Settings → Power → never sleep
   when plugged in* (or `powercfg /change standby-timeout-ac 0`), Linux inhibit as you prefer.
@@ -156,6 +156,8 @@ done. Endpoints:
 - `GET /v1/jobs` → the current/latest job's status, progress (step count + activity *category* only,
   never file contents), and the result once done.
 - `POST /v1/jobs/cancel` → stop the running job.
+- `POST /v1/jobs/heard` → the app spoke the latest job's question to you inline, so the inbox item
+  the bridge filed for it is retired (0.6.5+; the job view's `asked` flag says when this applies).
 
 One job at a time per bridge (same cwd-safety as chat). Job state is a small local file in the
 outside-workspace bridge state directory; a job left running when the helper is
