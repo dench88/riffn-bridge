@@ -371,6 +371,12 @@ The source of truth is `tools/riffin-bridge` in the Riffn monorepo (legacy folde
 npm without dragging the app monorepo along). Never publish any other way — versions 0.3–0.5
 were once published around the mirror and it silently fell months behind.
 
+The full picture — architecture, the release flow as a diagram, the workshop steps that fail
+silently when skipped, and what to deploy in which order — is the bridge manual in the monorepo:
+`dev_resources/my_manuals/riffn_bridge_manual.html` (on the maintainer's machine,
+`C:\dev\GitHub\riffn\dev_resources\my_manuals\riffn_bridge_manual.html`). This section is the
+short form of its release checklist.
+
 1. Bump `version` in the monorepo's `tools/riffin-bridge/package.json` (only ever bump it there).
 2. Sync the mirror: `tools\riffin-bridge\sync-bridge.ps1` — a robocopy `/MIR` of the source set;
    local state (`.env`, logs, session/job files, `node_modules`, `.git`) is never copied or
