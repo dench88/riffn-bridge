@@ -16,7 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { log } from "./log.js";
-import { fileAsk, fileCompleted, stripAsk } from "./inbox.js";
+import { fileAsk, fileCompleted, reportTaskState, stripAsk } from "./inbox.js";
 import { captureProfile } from "./inbox-routing.js";
 import { classifyFailure, operatorHint, FAILURE_CODES } from "./failure-codes.js";
 import { summariseForWire } from "./ask-marker.js";
@@ -595,10 +595,13 @@ export function createJobStore(cfg, session, pending = null) {
 
     // The user HEARD the latest job's question and is answering it in conversation — the app calls
     // this only for an inline-spoken result whose view says `asked`. The filed item is now moot:
-    // forget its pending context so a late inbox reply cannot re-run the question, then file the
-    // outcome exactly as an un-asked job does at close (which reports the task terminal and takes
-    // the item out of the user's view). Returns the public view, or null if there is no job.
-    // Idempotent: a repeat call files nothing twice.
+    // forget its pending context so a late inbox reply cannot re-run the question, and report the
+    // task COMPLETED so the item leaves the user's view. Returns the public view, or null if there
+    // is no job. Idempotent: a repeat call reports nothing twice.
+    //
+    // ⚠ The state report ONLY — no `completed` item. The user just listened to the result; a
+    // completion record would be a second push for a turn they were present for (0.6.6 filed one
+    // and the phone rang twice, 20 Sep 2026). Completions are for work the user walked away from.
     //
     // ⚠ Awaits the ask filing FIRST. The terminal report must land after the item exists — the
     // same race the close handler had to stop running, now resolved by ordering instead.
@@ -611,7 +614,7 @@ export function createJobStore(cfg, session, pending = null) {
       if (itemId) pending?.forget(itemId);
       job.heard = true;
       persist(job);
-      await fileJobOutcome(job);
+      await reportTaskState(cfg, job.taskId ?? `job-${job.id}`, "COMPLETED");
       return publicView(job);
     },
 

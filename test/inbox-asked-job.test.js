@@ -8,8 +8,8 @@
 // What this holds, driving the REAL job store with a fake agent binary:
 //   1. An asked job files the question and reports NO terminal state at close.
 //   2. heard() — the app spoke the question inline — waits for the filing, forgets the pending
-//      context, and only THEN files the outcome (state report before completed item, same as an
-//      un-asked job). Once, however many times it is called.
+//      context, and only THEN reports the task COMPLETED. No completed item: the user was present.
+//      Once, however many times it is called.
 //   3. An ordinary un-asked job files NOTHING — its task is unknown to the worker, which refused
 //      the completion every time (404 unknown_task_id, then 409 task_state_unknown).
 //   4. A reply-dispatch job continues the ANSWERED task (inboxTaskId): its completion files under
@@ -116,7 +116,7 @@ test("a job that asks files the question and reports no terminal state at close"
   assert.equal(pending.size, 1, "the question's context is remembered for a later inbox reply");
 }));
 
-test("heard(): retires the question after the filing landed, then files the outcome once", withFixture(async ({ jobs, pending, calls }) => {
+test("heard(): retires the question after the filing landed — state report only, once", withFixture(async ({ jobs, pending, calls }) => {
   process.env.RIFFN_TEST_FAKE_RESULT = "Looked at the schema.\nRIFFN_ASK/1: Drop the legacy column?";
   await runToEnd(jobs, "check the schema");
   const before = calls.length;
@@ -126,16 +126,16 @@ test("heard(): retires the question after the filing landed, then files the outc
   assert.equal(pending.size, 0, "a question answered aloud must not be re-run by a late inbox reply");
 
   const after = calls.slice(before);
-  assert.equal(after.length, 2, "one state report and one completed item");
+  assert.equal(after.length, 1, "the state report and nothing else");
   assert.match(after[0].path, /\/v1\/agent\/tasks\/job-.+\/state$/);
   assert.equal(after[0].body.task_state, "COMPLETED");
-  assert.equal(after[1].path, "/v1/agent/items");
-  assert.equal(after[1].body.kind, "completed");
-  assert.equal(after[1].body.task_id, items(calls, "question")[0].body.task_id, "same task as the question");
+  // ⚠ No completed item: the user just listened to the result. Filing one rang the phone a second
+  // time for a turn they were present for (20 Sep 2026).
+  assert.equal(items(calls, "completed").length, 0);
 
   // Idempotent: the app fires this without waiting, so a retry must be harmless.
   await jobs.heard();
-  assert.equal(calls.length, before + 2);
+  assert.equal(calls.length, before + 1);
 }));
 
 test("an ordinary job without an ask files nothing, and heard() is a no-op", withFixture(async ({ jobs, calls }) => {
