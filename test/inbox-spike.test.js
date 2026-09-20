@@ -248,7 +248,7 @@ test("a reply dispatch teaches the marker; an ordinary job does not", async () =
   );
   assert.match(
     dispatchSrc,
-    /jobs\.start\(prompt, ASK_MARKER_INSTRUCTION, caps\)/,
+    /jobs\.start\(prompt, ASK_MARKER_INSTRUCTION, caps, \{ inboxTaskId: reply\.task_id \}\)/,
     "the reply dispatch is the one path that should teach it",
   );
 });

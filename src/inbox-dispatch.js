@@ -236,7 +236,12 @@ export function createReplyDispatcher(cfg, {
     // marker. The user answered an inbox item and has moved on; if the agent needs something else
     // to finish, the inbox is the only way back to them. Contrast /v1/jobs, which also carries
     // ordinary spoken turns the user is sitting and listening to (see jobs.js).
-    const view = jobs.start(prompt, ASK_MARKER_INSTRUCTION, caps);
+    //
+    // `inboxTaskId`: this job CONTINUES the task the user just answered, so its outcome (and any
+    // re-ask) files under that task. That is what makes "task finished" reach the phone — under a
+    // fresh `job-<id>` the worker had never seen the task and refused the completion every time
+    // (20 Sep 2026 device logs: `409 task_state_unknown` after every reply job).
+    const view = jobs.start(prompt, ASK_MARKER_INSTRUCTION, caps, { inboxTaskId: reply.task_id });
     // null means the single-flight beat us between the isBusy() check and here. Nothing started.
     if (!view) throw new SnapshotError("the agent was busy when the reply was dispatched");
     return `job ${view.id}`;

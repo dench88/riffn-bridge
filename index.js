@@ -23,8 +23,23 @@
 // Security posture (v1): READ/PLAN-ONLY agent, tailnet-only bind, bearer token, argument-array exec,
 // single-flight, redact-by-default logs. Zero runtime dependencies (Node 18+ built-ins only).
 
+import dns from "node:dns";
+import net from "node:net";
 import path from "node:path";
 import { loadEnvFile, rotateToken } from "./src/env-file.js";
+
+// Outbound connections (the worker inbox calls, LLM/TTS proxies): give each address attempt a
+// realistic time to connect. Node's "happy eyeballs" default abandons an attempt after 250 ms and
+// moves to the next address, and the LAST attempt then waits unbounded — so on a 180 ms round trip
+// to the nearest Cloudflare edge, ordinary jitter abandoned the healthy IPv4 connect, fell through
+// to an IPv6 address the machine could not actually reach, and sat there until the bridge's own
+// 10 s timeout. Seen 20 Sep 2026 on a Linux workstation: most /v1/agent/*/lease polls "timed
+// out" from Node while curl on the same box answered in 100 ms every time, and the worker's own
+// logs showed the polls that did arrive completing in ~120 ms. Three seconds is generous for a
+// real connect and still far inside the 10 s call budget. IPv4 first so the common case is the
+// first attempt. Both set before any module opens a socket.
+dns.setDefaultResultOrder("ipv4first");
+net.setDefaultAutoSelectFamilyAttemptTimeout(3000);
 import {
   assertNoLegacyEnv, assertStateOutsideWorkspace, resolveStateDir,
 } from "./src/state.js";

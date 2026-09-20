@@ -210,7 +210,8 @@ export function createJobStore(cfg, session, pending = null) {
   /** Best-effort, detached. Never throws into the close handler. */
   async function fileJobOutcome(job) {
     const { taskState, summary } = outcomeSummary(job);
-    await fileCompleted(cfg, `job-${job.id}`, summary, taskState);
+    // `?? job-<id>`: a job record persisted by a bridge before 0.6.6 has no taskId.
+    await fileCompleted(cfg, job.taskId ?? `job-${job.id}`, summary, taskState);
   }
 
   // Ask filings in flight, by job id — each resolves to the worker item id or null. Only meaningful
@@ -298,7 +299,14 @@ export function createJobStore(cfg, session, pending = null) {
     // (server.js) enforces the two-key gate (cfg.allowEditJobs + the phone's explicit request);
     // this store just refuses to run an edit job without its snapshot — throws SnapshotError,
     // leaving no job record behind (nothing started).
-    start(prompt, appendSystemPrompt, caps) {
+    //
+    // `inboxTaskId`: the worker task this job CONTINUES — set by the inbox reply dispatch to the
+    // task the user just answered. Its ask and its outcome are then filed under that task, where
+    // the worker already holds it INPUT_REQUIRED: a re-ask files a new item on the same task and a
+    // completion is the legal INPUT_REQUIRED → COMPLETED step that puts "task finished" on the
+    // phone. Without it a job is its own task (`job-<id>`), which the worker only learns about if
+    // the job asks.
+    start(prompt, appendSystemPrompt, caps, { inboxTaskId = null } = {}) {
       if (live) return null;
       const id = randomUUID();
       // SECURITY (execute_jobs_plan.md): an EDIT job must NEVER resume the chat session. The
@@ -336,6 +344,11 @@ export function createJobStore(cfg, session, pending = null) {
       const job = {
         id, status: "running", startedAt: Date.now(), finishedAt: null,
         steps: 0, lastActivity: null, result: null, error: null,
+        // The worker task this job's ask/outcome file under (see start()'s doc). Local only.
+        taskId: inboxTaskId || `job-${id}`,
+        // True when the worker already knows that task — i.e. we are continuing an answered
+        // question — so a completion report is legal even if this job never asks.
+        continuesInboxTask: Boolean(inboxTaskId),
         // Public caps vocabulary stays "read" | "edit" (the wire the app already speaks): an
         // ungated job IS write-capable, and machine-level ungated-ness travels via /health
         // capabilities, not per-job.
@@ -504,7 +517,8 @@ export function createJobStore(cfg, session, pending = null) {
             // there is no session this question belongs to — null, never the chat session, which
             // resuming would drop the answer into the wrong conversation at the wrong permissions.
             const sessionId = caps === "edit" ? null : (session?.get() ?? null);
-            const taskId = `job-${id}`;
+            // A re-ask from a reply dispatch stays on the task the user is already following.
+            const taskId = job.taskId;
             // Kept so heard() can wait for the filing to land before it reports the task terminal.
             // Without that ordering the report can overtake the filing and bury the question.
             askFilings.set(id, fileAsk(cfg, asked.ask, taskId)
@@ -546,7 +560,14 @@ export function createJobStore(cfg, session, pending = null) {
         // above, and whenever the report landed second the question left the inbox the moment it
         // was filed (found 19 Sep 2026, first real device test). The outcome is filed later: by
         // heard() if the user answered inline, or by the reply dispatch's own job otherwise.
-        if (!job.asked) fileJobOutcome(job).catch(() => {});
+        //
+        // ⚠ ONLY for a task the worker already knows, i.e. a reply dispatch continuing an answered
+        // question. A task is born INPUT_REQUIRED (state machine §1.2), so an ordinary job that
+        // never asked has no task on the worker and its report is refused — 404 unknown_task_id,
+        // then 409 task_state_unknown for the item — two wasted calls on every spoken turn, and no
+        // history entry either way (20 Sep 2026 device logs). Whether ordinary jobs should get a
+        // "what did my agents do today" record is a design decision (next_steps.md), not a retry.
+        if (!job.asked && job.continuesInboxTask) fileJobOutcome(job).catch(() => {});
         // Operator-facing recovery pointer for edit jobs — full ref is fine on the local terminal
         // (different trust boundary than the wire). Printed at every edit-job end, not just verbose.
         if (job.caps === "edit" && job.snapshotRef) {

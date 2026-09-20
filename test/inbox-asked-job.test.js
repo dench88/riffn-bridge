@@ -10,7 +10,10 @@
 //   2. heard() — the app spoke the question inline — waits for the filing, forgets the pending
 //      context, and only THEN files the outcome (state report before completed item, same as an
 //      un-asked job). Once, however many times it is called.
-//   3. An un-asked job is unchanged: outcome filed at close, heard() is a no-op.
+//   3. An ordinary un-asked job files NOTHING — its task is unknown to the worker, which refused
+//      the completion every time (404 unknown_task_id, then 409 task_state_unknown).
+//   4. A reply-dispatch job continues the ANSWERED task (inboxTaskId): its completion files under
+//      that task, state report first — the "task finished" leg of the loop.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -66,8 +69,8 @@ function mockWorker(t) {
   return calls;
 }
 
-async function runToEnd(jobs, prompt) {
-  const started = jobs.start(prompt, "", "read");
+async function runToEnd(jobs, prompt, options = {}) {
+  const started = jobs.start(prompt, "", "read", options);
   assert.equal(started.status, "running");
   const deadline = Date.now() + 4000;
   while (jobs.current().status === "running" && Date.now() < deadline) {
@@ -135,21 +138,44 @@ test("heard(): retires the question after the filing landed, then files the outc
   assert.equal(calls.length, before + 2);
 }));
 
-test("a job without an ask still files its outcome at close, and heard() is a no-op", withFixture(async ({ jobs, calls }) => {
+test("an ordinary job without an ask files nothing, and heard() is a no-op", withFixture(async ({ jobs, calls }) => {
   process.env.RIFFN_TEST_FAKE_RESULT = "Renamed the handler and the tests pass.";
   const view = await runToEnd(jobs, "rename it");
 
   assert.equal(view.status, "done");
   assert.equal(view.asked, false);
-  assert.equal(items(calls, "question").length, 0);
-  assert.equal(stateReports(calls).length, 1);
-  assert.equal(stateReports(calls)[0].body.task_state, "COMPLETED");
-  assert.equal(items(calls, "completed").length, 1);
+  // The worker has never heard of job-<id> (a task is born INPUT_REQUIRED), so the state report
+  // and the completed item were refused on every spoken turn — two wasted calls, no history row.
+  assert.equal(calls.length, 0, "no worker call for a task the worker cannot accept");
 
-  const before = calls.length;
   const heard = await jobs.heard();
   assert.equal(heard.asked, false);
-  assert.equal(calls.length, before, "nothing to retire, nothing filed twice");
+  assert.equal(calls.length, 0);
+}));
+
+test("a job continuing an answered task files its completion under THAT task, state first", withFixture(async ({ jobs, calls }) => {
+  process.env.RIFFN_TEST_FAKE_RESULT = "Dropped the legacy column and updated the migration.";
+  const view = await runToEnd(jobs, "the user said: drop it", { inboxTaskId: "job-original" });
+
+  assert.equal(view.status, "done");
+  assert.equal(view.asked, false);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].path, "/v1/agent/tasks/job-original/state");
+  assert.equal(calls[0].body.task_state, "COMPLETED");
+  assert.equal(calls[1].path, "/v1/agent/items");
+  assert.equal(calls[1].body.kind, "completed");
+  assert.equal(calls[1].body.task_id, "job-original", "the completion sits beside the question it answers");
+}));
+
+test("a re-ask from a continued task stays on the original task id", withFixture(async ({ jobs, calls, pending }) => {
+  process.env.RIFFN_TEST_FAKE_RESULT = "Nearly there.\nRIFFN_ASK/1: Also drop the index?";
+  const view = await runToEnd(jobs, "the user said: drop it", { inboxTaskId: "job-original" });
+
+  assert.equal(view.asked, true);
+  assert.equal(items(calls, "question").length, 1);
+  assert.equal(items(calls, "question")[0].body.task_id, "job-original");
+  assert.equal(stateReports(calls).length, 0, "still INPUT_REQUIRED — no terminal report");
+  assert.equal(pending.size, 1);
 }));
 
 test("heard() with no job at all answers null rather than throwing", withFixture(async ({ jobs }) => {

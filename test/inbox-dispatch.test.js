@@ -48,9 +48,9 @@ function fakeJobs({ start } = {}) {
   return {
     calls,
     isRunning: () => false,
-    start: (prompt, systemPrompt, caps) => {
-      calls.push({ prompt, systemPrompt, caps });
-      if (start) return start(prompt, systemPrompt, caps);
+    start: (prompt, systemPrompt, caps, options = {}) => {
+      calls.push({ prompt, systemPrompt, caps, inboxTaskId: options.inboxTaskId ?? null });
+      if (start) return start(prompt, systemPrompt, caps, options);
       return { id: "job-1", status: "running" };
     },
   };
@@ -193,6 +193,9 @@ test("disabled: dispatches a read job, which resumes the session read-only", asy
 
   assert.equal(s.jobs.calls.length, 1);
   assert.equal(s.jobs.calls[0].caps, undefined, "undefined is jobs.start's spelling for a read job");
+  // The reply job CONTINUES the answered task, so its completion can reach the phone (a fresh
+  // job-<id> task is unknown to the worker and its completion was refused every time, 20 Sep 2026).
+  assert.equal(s.jobs.calls[0].inboxTaskId, "job-7");
   assert.deepEqual(s.worker.acks(), [{ replyId: "rep_1", outcome: "delivered", reason: null }]);
 });
 
